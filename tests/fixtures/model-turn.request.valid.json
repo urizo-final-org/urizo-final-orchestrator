@@ -1,0 +1,42 @@
+{
+  "schemaVersion": "1.0",
+  "turnId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  "jobId": "55555555-5555-4555-8555-555555555555",
+  "traceId": "66666666-6666-4666-8666-666666666666",
+  "idempotencyKey": "stage0.model.turn.0001",
+  "attempt": 1,
+  "expectedStateVersion": 4,
+  "nodeName": "plan",
+  "promptVersion": "coding-plan-v1",
+  "contextDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "requiredCapabilities": ["CHAT", "TOOL_CALLING"],
+  "messages": [
+    {
+      "role": "system",
+      "content": "Plan within the approved repository scope."
+    },
+    {
+      "role": "user",
+      "content": "Inspect the contract README."
+    }
+  ],
+  "toolSchemas": [
+    {
+      "name": "read_file",
+      "description": "Read one approved relative file.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path"],
+        "properties": {
+          "path": { "type": "string" }
+        }
+      },
+      "schemaDigest": "sha256:39b714704935190561ed407980480b9a4a0b346b97346e0bff71fb9ace820194"
+    }
+  ],
+  "responseFormat": {
+    "type": "TEXT"
+  },
+  "deadlineAt": "2026-08-10T09:11:00Z"
+}
