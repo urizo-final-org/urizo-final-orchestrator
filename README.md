@@ -124,8 +124,8 @@ and starts an authoritative Job, and calls
 It verifies a real HTTP request and DB-backed idempotent replay without any
 Provider call.
 
-## Workflow
+## Team policy authority
 
-Normal changes use `latest dev -> feature/<work-slug> -> pull request to dev`.
-Direct pushes to `dev` and `main` are reserved for explicitly approved owner
-bootstrap or emergency recovery.
+Cross-repository workflow, current Wave/Slice state, assignments, and Git/PR policy are owned by the
+sibling Master repository. Start from the canonical parent workspace and follow
+`../urizo-final-master/AGENTS.md`; this README contains only Orchestrator runtime and verification facts.
