@@ -506,7 +506,7 @@ def _request_http(
     method: str,
     endpoint: str,
     body: bytes | None,
-    credential: bytearray,
+    credential: bytearray | None,
     timeout: float,
 ) -> tuple[int, bytes]:
     """Minimal HTTP/1.1 transport for the local Spring service boundary.
@@ -531,9 +531,11 @@ def _request_http(
             raise ValueError("unsupported HTTP method")
         wire.extend(f"{method} {target} HTTP/1.1\r\n".encode("ascii"))
         wire.extend(f"Host: {host_header}\r\n".encode("ascii"))
-        wire.extend(b"Accept: application/json\r\nAuthorization: Bearer ")
-        wire.extend(credential)
-        wire.extend(b"\r\n")
+        wire.extend(b"Accept: application/json\r\n")
+        if credential is not None:
+            wire.extend(b"Authorization: Bearer ")
+            wire.extend(credential)
+            wire.extend(b"\r\n")
         if body is not None:
             wire.extend(b"Content-Type: application/json\r\n")
             wire.extend(f"Content-Length: {len(body)}\r\n".encode("ascii"))

@@ -183,6 +183,7 @@ class WorkerApiClientTest(unittest.TestCase):
         }
         with worker_server({"/api/health": (200, healthy)}) as origin:
             self.assertTrue(self.client(origin).healthy())
+            self.assertIsNone(_Handler.observed[0][2])
 
         healthy["provider"] = "LOCAL"
         with worker_server({"/api/health": (200, healthy)}) as origin:
