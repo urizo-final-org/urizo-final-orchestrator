@@ -167,7 +167,11 @@ class WorkerApiClient:
 
         try:
             response = self._call(
-                "GET", "/api/health", None, timeout_seconds=min(2.0, self._timeout_seconds)
+                "GET",
+                "/api/health",
+                None,
+                timeout_seconds=min(2.0, self._timeout_seconds),
+                authenticated=False,
             )
             if set(response) != {"schemaVersion", "traceId", "status", "checkedAt"}:
                 return False
@@ -192,24 +196,26 @@ class WorkerApiClient:
         *,
         timeout_seconds: float | None = None,
         error_context: Mapping[str, Any] | None = None,
+        authenticated: bool = True,
     ) -> Mapping[str, Any]:
         credential = bytearray()
         try:
-            try:
-                with self._credential_resolver() as lease:
-                    credential = lease.copy()
-            except ModelGatewayRemoteError:
-                raise WorkerApiError(
-                    "CODING_AGENT_NOT_AVAILABLE",
-                    "Spring worker credential is unavailable.",
-                    retryable=False,
-                ) from None
+            if authenticated:
+                try:
+                    with self._credential_resolver() as lease:
+                        credential = lease.copy()
+                except ModelGatewayRemoteError:
+                    raise WorkerApiError(
+                        "CODING_AGENT_NOT_AVAILABLE",
+                        "Spring worker credential is unavailable.",
+                        retryable=False,
+                    ) from None
             try:
                 status, raw = _request_http(
                     method,
                     self._origin + path,
                     body,
-                    credential,
+                    credential if authenticated else None,
                     self._timeout_seconds
                     if timeout_seconds is None
                     else timeout_seconds,
