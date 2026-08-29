@@ -1,0 +1,51 @@
+{
+  "contractVersion": "1.0",
+  "profileVersionId": "11111111-1111-4111-8111-111111111111",
+  "profileKey": "LLM_OPS",
+  "profileVersion": 1,
+  "nodes": [
+    {
+      "id": "start",
+      "type": "start",
+      "handlerKey": "fixture.start",
+      "resultPorts": ["next"],
+      "config": {}
+    },
+    {
+      "id": "guardrail",
+      "type": "guardrail",
+      "handlerKey": "fixture.guardrail",
+      "resultPorts": ["passed"],
+      "config": {"locked": true}
+    },
+    {
+      "id": "analyze",
+      "type": "agent",
+      "handlerKey": "fixture.analyze",
+      "resultPorts": ["completed"],
+      "config": {"promptKey": "fixture.analysis"}
+    },
+    {
+      "id": "end",
+      "type": "end",
+      "handlerKey": "fixture.end",
+      "resultPorts": [],
+      "config": {}
+    }
+  ],
+  "edges": [
+    {"from": "start", "resultPort": "next", "to": "guardrail"},
+    {"from": "guardrail", "resultPort": "passed", "to": "analyze"},
+    {"from": "analyze", "resultPort": "completed", "to": "end"}
+  ],
+  "config": {
+    "maxNodes": 8,
+    "maxAttempts": 3,
+    "loopLimits": []
+  },
+  "modelBindings": {
+    "analyze": {"primary": "fixture-model", "fallback": []}
+  },
+  "toolPolicy": {"allowedTools": []},
+  "guardrailProfileKey": "central.default"
+}
