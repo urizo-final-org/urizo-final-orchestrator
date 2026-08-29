@@ -74,12 +74,17 @@ class _Heartbeat:
 
 
 class _Graph:
-    def __init__(self, *, duplicate: bool = False, failure=None) -> None:
+    def __init__(
+        self, *, duplicate: bool = False, failure=None, duplicate_failure=None
+    ) -> None:
         self.duplicate = duplicate
         self.failure = failure
+        self.duplicate_failure = duplicate_failure
         self.invocations = 0
 
     def is_duplicate(self, event):
+        if self.duplicate_failure is not None:
+            raise self.duplicate_failure
         return self.duplicate
 
     def invoke(self, event, claim):
@@ -148,6 +153,14 @@ class WorkerLoopTest(unittest.TestCase):
         self.assertTrue(loop.process(event))
 
         self.assertEqual(0, worker.claim_calls)
+
+    def test_duplicate_probe_failure_is_requeued_without_claim(self) -> None:
+        graph = _Graph(duplicate_failure=RuntimeError("fixture probe failure"))
+        event, worker, heartbeat, _, loop = self.build(graph=graph)
+
+        self.assertFalse(loop.process(event))
+        self.assertEqual(0, worker.claim_calls)
+        self.assertEqual([], heartbeat.started)
 
     def test_run_acks_duplicate_but_requeues_unclaimed_delivery(self) -> None:
         event = CodingJobRequested.from_dict(coding_event())

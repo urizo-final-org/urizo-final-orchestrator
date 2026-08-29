@@ -29,6 +29,7 @@ from .model_gateway import (
     ModelGatewayRemoteError,
 )
 from .queue import QueueError, ValkeyJobQueue
+from .snapshot_runner import CodingGraphRunnerAdapter, WorkerGraphRunner
 from .tool_gateway import ToolGatewayClient, ToolGatewayError
 from .worker_api import WorkerApiClient, WorkerApiError
 
@@ -166,7 +167,7 @@ class WorkerLoop:
         self,
         queue: ValkeyJobQueue,
         worker_api: WorkerApiClient,
-        graph: CodingGraphRunner,
+        graph: WorkerGraphRunner,
         heartbeat: LeaseHeartbeatManager,
         health: HealthState,
         *,
@@ -223,10 +224,10 @@ class WorkerLoop:
                     pass
 
     def process(self, event: CodingJobRequested) -> bool:
-        if self._graph.is_duplicate(event):
-            return True
         claim: WorkerClaim | None = None
         try:
+            if self._graph.is_duplicate(event):
+                return True
             claim = self._claim_with_backoff(event)
             self._heartbeat.start(claim)
             self._graph.invoke(event, claim)
@@ -343,15 +344,17 @@ def main() -> None:
             credential_resolver,
         )
         tool_gateway = ToolGatewayClient(settings.spring_origin, credential_resolver)
-        graph = CodingGraphRunner(
-            build_coding_graph(
-                checkpoint.checkpointer,
-                GraphDependencies(
-                    model_gateway=model_gateway,
-                    tool_gateway=tool_gateway,
-                    worker_api=worker_api,
-                    lease_guard=heartbeat,
-                ),
+        graph = CodingGraphRunnerAdapter(
+            CodingGraphRunner(
+                build_coding_graph(
+                    checkpoint.checkpointer,
+                    GraphDependencies(
+                        model_gateway=model_gateway,
+                        tool_gateway=tool_gateway,
+                        worker_api=worker_api,
+                        lease_guard=heartbeat,
+                    ),
+                )
             )
         )
         loop = WorkerLoop(

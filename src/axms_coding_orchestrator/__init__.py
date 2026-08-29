@@ -40,12 +40,20 @@ from .graph_builder import (
     SnapshotGraphBuilder,
     SnapshotGraphExecutionError,
 )
+from .snapshot_runner import (
+    CodingGraphRunnerAdapter,
+    SnapshotExecution,
+    SnapshotExecutionProvider,
+    SnapshotGraphRunner,
+    WorkerGraphRunner,
+)
 from .tool_gateway import ToolExecutionResult, ToolGatewayClient
 from .worker_api import WorkerApiClient
 
 __all__ = [
     "ContractViolation",
     "CodingGraphRunner",
+    "CodingGraphRunnerAdapter",
     "CodingJobRequested",
     "ClaimSnapshot",
     "FileServiceCredentialResolver",
@@ -64,6 +72,9 @@ __all__ = [
     "SnapshotGraphBuildError",
     "SnapshotGraphBuilder",
     "SnapshotGraphExecutionError",
+    "SnapshotExecution",
+    "SnapshotExecutionProvider",
+    "SnapshotGraphRunner",
     "ServiceCredentialLease",
     "SnapshotConfig",
     "SnapshotContractViolation",
@@ -75,6 +86,7 @@ __all__ = [
     "VersionedSnapshot",
     "WorkerApiClient",
     "WorkerClaim",
+    "WorkerGraphRunner",
     "build_coding_graph",
     "load_snapshot_json",
     "validate_snapshot",

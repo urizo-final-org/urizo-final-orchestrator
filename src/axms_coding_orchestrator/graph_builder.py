@@ -38,6 +38,10 @@ class _SnapshotGraphState(TypedDict, total=False):
     _snapshotLoopCounts: dict[str, int]
     _snapshotLastNodeId: str
     _snapshotLastResultPort: str | None
+    _snapshotEvent: dict[str, Any]
+    _snapshotClaim: dict[str, Any]
+    _snapshotLedger: dict[str, Any]
+    _snapshotProfileDigest: str
 
 
 class SnapshotGraphBuilder:

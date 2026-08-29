@@ -42,9 +42,11 @@ An immutable Versioned Profile Snapshot contract now validates `nodes`,
 Guardrail passage, and bounded loop declarations. A source-only Node Registry,
 immutable Node Invocation/Result contracts, and an in-memory Graph Builder can
 compile those validated Snapshots with exact Node Type/Port binding and bounded
-loop enforcement. Only fixture handlers exercise this path; it remains separate
-from the existing Coding claim snapshot and is not connected to the current
-graph or worker path yet.
+loop enforcement. An injected execution provider and Worker-compatible Snapshot
+Runner preserve `thread_id == jobId`, checkpoint idempotency, failed-node retry,
+and approval interrupt/resume for fixture handlers. The production service still
+uses the current Coding runner through its compatibility Adapter; Spring Profile
+lookup and live Snapshot selection are not connected yet.
 
 `/health/live` reports process liveness. `/health/ready` dynamically probes the
 Checkpoint DB, Valkey, and Spring on every request and returns `503` if any
@@ -94,11 +96,11 @@ uv run --frozen python -B -m unittest discover -s tests -v
 ```
 
 Tests cover immutable Versioned Snapshot loading and validation, Registry and
-Graph Builder linear/branch/bounded-loop contracts, Backend golden Model Turn
-payloads, exact-origin and credential handling, queue/claim/lease contracts,
-Tool request/result binding, encrypted serialization, persistent
-interrupt/resume, duplicate suppression, retry/backoff, lease loss, and dynamic
-dependency readiness.
+Graph Builder linear/branch/bounded-loop contracts, Snapshot Runner checkpoint
+compatibility, Backend golden Model Turn payloads, exact-origin and credential
+handling, queue/claim/lease contracts, Tool request/result binding, encrypted
+serialization, persistent interrupt/resume, duplicate suppression,
+retry/backoff, lease loss, and dynamic dependency readiness.
 
 The Backend repository owns the primary local/full-profile acceptance. Run
 these commands from the sibling `urizo-final-backend` repository after the
@@ -118,8 +120,8 @@ bounded dependency failure/recovery checks.
 
 Latest verified Orchestrator evidence:
 
-- Python contract/runtime suite: 85 of 85 tests passed.
-- Syntax gate: 32 Python files parsed successfully.
+- Python contract/runtime suite: 96 of 96 tests passed.
+- Syntax gate: 34 Python files parsed successfully.
 - The frozen `uv.lock` image built with Python 3.12.13 and ran as non-root UID
   10001.
 - Full Compose `coding-runtime` returned HTTP 200 from both `/health/live` and
