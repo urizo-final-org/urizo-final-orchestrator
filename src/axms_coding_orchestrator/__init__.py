@@ -16,6 +16,16 @@ from .model_gateway import (
     ModelTurnResponse,
     ServiceCredentialLease,
 )
+from .snapshot import (
+    SnapshotConfig,
+    SnapshotContractViolation,
+    SnapshotEdge,
+    SnapshotLoopLimit,
+    SnapshotNode,
+    VersionedSnapshot,
+    load_snapshot_json,
+    validate_snapshot,
+)
 from .tool_gateway import ToolExecutionResult, ToolGatewayClient
 from .worker_api import WorkerApiClient
 
@@ -31,9 +41,17 @@ __all__ = [
     "ModelTurnRequest",
     "ModelTurnResponse",
     "ServiceCredentialLease",
+    "SnapshotConfig",
+    "SnapshotContractViolation",
+    "SnapshotEdge",
+    "SnapshotLoopLimit",
+    "SnapshotNode",
     "ToolExecutionResult",
     "ToolGatewayClient",
+    "VersionedSnapshot",
     "WorkerApiClient",
     "WorkerClaim",
     "build_coding_graph",
+    "load_snapshot_json",
+    "validate_snapshot",
 ]
