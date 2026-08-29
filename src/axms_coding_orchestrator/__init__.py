@@ -26,6 +26,20 @@ from .snapshot import (
     load_snapshot_json,
     validate_snapshot,
 )
+from .node_runtime import (
+    NodeContractViolation,
+    NodeHandler,
+    NodeHandlerRegistration,
+    NodeInvocation,
+    NodeRegistry,
+    NodeRegistryViolation,
+    NodeResult,
+)
+from .graph_builder import (
+    SnapshotGraphBuildError,
+    SnapshotGraphBuilder,
+    SnapshotGraphExecutionError,
+)
 from .tool_gateway import ToolExecutionResult, ToolGatewayClient
 from .worker_api import WorkerApiClient
 
@@ -40,6 +54,16 @@ __all__ = [
     "ModelGatewayRemoteError",
     "ModelTurnRequest",
     "ModelTurnResponse",
+    "NodeContractViolation",
+    "NodeHandler",
+    "NodeHandlerRegistration",
+    "NodeInvocation",
+    "NodeRegistry",
+    "NodeRegistryViolation",
+    "NodeResult",
+    "SnapshotGraphBuildError",
+    "SnapshotGraphBuilder",
+    "SnapshotGraphExecutionError",
     "ServiceCredentialLease",
     "SnapshotConfig",
     "SnapshotContractViolation",
