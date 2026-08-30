@@ -2,16 +2,13 @@ from __future__ import annotations
 
 import unittest
 
-from axms_coding_orchestrator.contracts import CodingJobRequested
+from axms_coding_orchestrator.contracts import QueuedJobReference
 from axms_coding_orchestrator.queue import (
     PROCESSING_QUEUE_KEY,
     QUEUE_KEY,
     QueueError,
     ValkeyJobQueue,
 )
-
-from factories import coding_event
-
 
 class _FakeRedis:
     def __init__(self, source=None, processing=None, *, healthy: bool = True) -> None:
@@ -63,42 +60,46 @@ class ValkeyJobQueueTest(unittest.TestCase):
         queue._client = client
         return queue
 
-    def test_blmove_then_ack_consumes_only_the_versioned_strict_event(self) -> None:
-        event = CodingJobRequested.from_dict(coding_event())
-        client = _FakeRedis([event.to_json()])
+    def test_blmove_then_ack_consumes_only_the_strict_job_reference(self) -> None:
+        job = QueuedJobReference.from_dict(
+            {"jobId": "20202020-2020-4020-8020-202020202020"}
+        )
+        client = _FakeRedis([job.to_json()])
         queue = self.queue(client)
 
         delivery = queue.pop(5)
 
-        self.assertEqual(event.event_id, delivery.event.event_id)
+        self.assertEqual(job.job_id, delivery.job.job_id)
         self.assertEqual(
             (QUEUE_KEY, PROCESSING_QUEUE_KEY, 5, "RIGHT", "LEFT"),
             client.observed,
         )
-        self.assertEqual([event.to_json()], client.lists[PROCESSING_QUEUE_KEY])
+        self.assertEqual([job.to_json()], client.lists[PROCESSING_QUEUE_KEY])
         queue.ack(delivery)
         self.assertEqual([], client.lists[PROCESSING_QUEUE_KEY])
         self.assertTrue(queue.healthy())
         self.assertNotIn("test-only-password", repr(queue))
-        self.assertNotIn("actorId", repr(delivery))
+        self.assertNotIn("profileVersionId", repr(delivery))
 
     def test_unknown_queue_envelope_fails_closed(self) -> None:
         client = _FakeRedis([b'{"providerKey":"hidden"}'])
         queue = self.queue(client)
 
-        with self.assertRaisesRegex(QueueError, "contract") as raised:
+        with self.assertRaisesRegex(QueueError, "reference") as raised:
             queue.pop(1)
 
         self.assertNotIn("providerKey", str(raised.exception))
         self.assertEqual([], client.lists[PROCESSING_QUEUE_KEY])
 
     def test_startup_recovery_preserves_oldest_first_delivery_order(self) -> None:
-        oldest = CodingJobRequested.from_dict(coding_event()).to_json()
-        newer = CodingJobRequested.from_dict(
-            coding_event(event_id="15151515-1515-4515-8515-151515151515", version=5)
+        oldest = QueuedJobReference.from_dict(
+            {"jobId": "20202020-2020-4020-8020-202020202020"}
         ).to_json()
-        new_source = CodingJobRequested.from_dict(
-            coding_event(event_id="16161616-1616-4616-8616-161616161616", version=6)
+        newer = QueuedJobReference.from_dict(
+            {"jobId": "21212121-2121-4121-8121-212121212121"}
+        ).to_json()
+        new_source = QueuedJobReference.from_dict(
+            {"jobId": "22222222-2222-4222-8222-222222222222"}
         ).to_json()
         client = _FakeRedis(
             source=[new_source],
@@ -115,15 +116,17 @@ class ValkeyJobQueueTest(unittest.TestCase):
         )
 
     def test_failed_delivery_can_be_atomically_requeued(self) -> None:
-        event = CodingJobRequested.from_dict(coding_event())
-        client = _FakeRedis([event.to_json()])
+        job = QueuedJobReference.from_dict(
+            {"jobId": "20202020-2020-4020-8020-202020202020"}
+        )
+        client = _FakeRedis([job.to_json()])
         queue = self.queue(client)
         delivery = queue.pop(1)
 
         queue.requeue(delivery)
 
         self.assertEqual([], client.lists[PROCESSING_QUEUE_KEY])
-        self.assertEqual([event.to_json()], client.lists[QUEUE_KEY])
+        self.assertEqual([job.to_json()], client.lists[QUEUE_KEY])
 
 
 if __name__ == "__main__":

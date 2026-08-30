@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -14,7 +15,7 @@ from typing import Any, Callable
 
 from .checkpoint import CheckpointError, CheckpointRuntime
 from .config import ConfigurationError, RuntimeSettings
-from .contracts import CodingJobRequested, WorkerClaim
+from .contracts import CodingJobRequested, QueuedJobReference, WorkerClaim
 from .graph import (
     CodingGraphRunner,
     GraphDependencies,
@@ -28,8 +29,16 @@ from .model_gateway import (
     ModelGatewayClient,
     ModelGatewayRemoteError,
 )
+from .node_runtime import NodeRegistry
+from .profile_version_client import ProfileVersionClient
 from .queue import QueueError, ValkeyJobQueue
-from .snapshot_runner import CodingGraphRunnerAdapter, WorkerGraphRunner
+from .snapshot_runner import (
+    CodingGraphRunnerAdapter,
+    ProfileBoundWorkerGraphRouter,
+    SnapshotGraphRunner,
+    WorkerGraphRunner,
+)
+from .spring_snapshot_provider import SpringSnapshotExecutionProvider
 from .tool_gateway import ToolGatewayClient, ToolGatewayError
 from .worker_api import WorkerApiClient, WorkerApiError
 
@@ -207,7 +216,7 @@ class WorkerLoop:
                 continue
             if delivery is None:
                 continue
-            acknowledged = self.process(delivery.event)
+            acknowledged = self.process(delivery.job)
             try:
                 if acknowledged:
                     self._queue.ack(delivery)
@@ -223,25 +232,46 @@ class WorkerLoop:
                 except QueueError:
                     pass
 
-    def process(self, event: CodingJobRequested) -> bool:
+    def process(self, job: QueuedJobReference) -> bool:
+        event: CodingJobRequested | None = None
         claim: WorkerClaim | None = None
         try:
-            if self._graph.is_duplicate(event):
+            event = self._resolve_with_backoff(job)
+            duplicate = self._graph.is_duplicate(event)
+            if duplicate and not event.is_profile_bound:
                 return True
             claim = self._claim_with_backoff(event)
             self._heartbeat.start(claim)
-            self._graph.invoke(event, claim)
+            result = self._graph.invoke(event, claim)
+            if event.is_profile_bound and not self._report_success(claim, result):
+                return False
             self._health.update(last_error_code=None)
             return True
         except Exception as failure:
             retryable, code = _classify_failure(failure)
             self._health.update(last_error_code=code)
-            if claim is not None:
+            if claim is not None and event is not None:
                 return self._report_failure(event, claim, retryable, code)
+            if isinstance(failure, WorkerApiError):
+                return event is None and _is_terminal_resolve_rejection(failure)
             return False
         finally:
             if claim is not None:
                 self._heartbeat.stop(claim.job_id)
+
+    def _resolve_with_backoff(self, job: QueuedJobReference) -> CodingJobRequested:
+        last: WorkerApiError | None = None
+        for attempt in range(1, self._max_attempts + 1):
+            try:
+                return self._worker_api.resolve(job)
+            except WorkerApiError as failure:
+                last = failure
+                if not failure.retryable or attempt == self._max_attempts:
+                    raise
+                delay = min(2 ** (attempt - 1), self._max_backoff_seconds)
+                self._sleep(delay)
+        assert last is not None
+        raise last
 
     def _claim_with_backoff(self, event: CodingJobRequested) -> WorkerClaim:
         last: WorkerApiError | None = None
@@ -256,6 +286,35 @@ class WorkerLoop:
                 self._sleep(delay)
         assert last is not None
         raise last
+
+    def _report_success(
+        self,
+        claim: WorkerClaim,
+        result: Any,
+    ) -> bool:
+        if not isinstance(result, Mapping) or result.get("status") not in {
+            "WAITING_APPROVAL",
+            "COMPLETED",
+        }:
+            raise GraphExecutionError(
+                "CONTRACT_VALIDATION_FAILED",
+                "The Snapshot graph returned an invalid terminal outcome.",
+                retryable=False,
+            )
+        outcome = result["status"]
+        try:
+            self._heartbeat.ensure_current(claim)
+            self._worker_api.outcome(
+                claim,
+                outcome,
+                _outcome_key(claim, outcome),
+            )
+            return True
+        except LeaseLostError:
+            return False
+        except WorkerApiError as failure:
+            self._health.update(last_error_code=failure.code)
+            return False
 
     def _report_failure(
         self,
@@ -273,15 +332,13 @@ class WorkerLoop:
             if retryable and event.attempt < self._max_attempts
             else "PERMANENT_FAILURE"
         )
-        identity = "%s|%s|%d|%s" % (
-            claim.job_id,
-            claim.lease_id,
-            claim.state_version,
-            outcome,
-        )
-        key = "outcome." + hashlib.sha256(identity.encode("utf-8")).hexdigest()
         try:
-            self._worker_api.outcome(claim, outcome, key, error_code=code)
+            self._worker_api.outcome(
+                claim,
+                outcome,
+                _outcome_key(claim, outcome),
+                error_code=code,
+            )
             return True
         except WorkerApiError:
             return False
@@ -302,6 +359,23 @@ def _classify_failure(failure: Exception) -> tuple[bool, str]:
         retryable = bool(getattr(failure, "retryable", False))
         return retryable, code
     return True, "INTERNAL_TRANSIENT_ERROR"
+
+
+def _is_terminal_resolve_rejection(failure: WorkerApiError) -> bool:
+    return not failure.retryable and (failure.status, failure.code) in {
+        (404, "JOB_NOT_FOUND"),
+        (409, "JOB_STATE_VERSION_CONFLICT"),
+    }
+
+
+def _outcome_key(claim: WorkerClaim, outcome: str) -> str:
+    identity = "%s|%s|%d|%s" % (
+        claim.job_id,
+        claim.lease_id,
+        claim.state_version,
+        outcome,
+    )
+    return "outcome." + hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
 def main() -> None:
@@ -344,7 +418,7 @@ def main() -> None:
             credential_resolver,
         )
         tool_gateway = ToolGatewayClient(settings.spring_origin, credential_resolver)
-        graph = CodingGraphRunnerAdapter(
+        legacy_graph = CodingGraphRunnerAdapter(
             CodingGraphRunner(
                 build_coding_graph(
                     checkpoint.checkpointer,
@@ -357,6 +431,14 @@ def main() -> None:
                 )
             )
         )
+        snapshot_graph = SnapshotGraphRunner(
+            SpringSnapshotExecutionProvider(
+                ProfileVersionClient(settings.spring_origin, credential_resolver)
+            ),
+            NodeRegistry(),
+            checkpoint.checkpointer,
+        )
+        graph = ProfileBoundWorkerGraphRouter(legacy_graph, snapshot_graph)
         loop = WorkerLoop(
             queue,
             worker_api,

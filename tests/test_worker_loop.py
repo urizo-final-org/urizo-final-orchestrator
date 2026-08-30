@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import unittest
 
-from axms_coding_orchestrator.contracts import CodingJobRequested, WorkerClaim
+from axms_coding_orchestrator.contracts import (
+    CodingJobRequested,
+    QueuedJobReference,
+    WorkerClaim,
+)
 from axms_coding_orchestrator.graph import GraphExecutionError
 from axms_coding_orchestrator.queue import QueueDelivery
 from axms_coding_orchestrator.service import HealthState, WorkerLoop
@@ -39,14 +43,36 @@ class _RunQueue:
 
 
 class _WorkerApi:
-    def __init__(self, claim, failures: int = 0) -> None:
+    def __init__(
+        self,
+        event,
+        claim,
+        failures: int = 0,
+        *,
+        resolve_error: WorkerApiError | None = None,
+        claim_error: WorkerApiError | None = None,
+    ) -> None:
+        self.authoritative_event = event
         self.authoritative_claim = claim
         self.failures = failures
+        self.resolve_error = resolve_error
+        self.claim_error = claim_error
+        self.resolve_calls = 0
         self.claim_calls = 0
         self.outcomes = []
 
+    def resolve(self, job):
+        self.resolve_calls += 1
+        if self.resolve_error is not None:
+            raise self.resolve_error
+        if job.job_id != self.authoritative_event.job_id:
+            raise AssertionError("job reference mismatch")
+        return self.authoritative_event
+
     def claim(self, event):
         self.claim_calls += 1
+        if self.claim_error is not None:
+            raise self.claim_error
         if self.claim_calls <= self.failures:
             raise WorkerApiError(
                 "INTERNAL_TRANSIENT_ERROR", "safe transient", retryable=True
@@ -100,7 +126,7 @@ class WorkerLoopTest(unittest.TestCase):
         claim = WorkerClaim.from_dict(
             worker_claim(event.to_dict()), event, now=FIXED_NOW
         )
-        worker = _WorkerApi(claim, failures)
+        worker = _WorkerApi(event, claim, failures)
         heartbeat = _Heartbeat()
         delays = []
         loop = WorkerLoop(
@@ -116,16 +142,39 @@ class WorkerLoopTest(unittest.TestCase):
         )
         return event, worker, heartbeat, delays, loop
 
+    @staticmethod
+    def job(event: CodingJobRequested) -> QueuedJobReference:
+        return QueuedJobReference.from_dict({"jobId": event.job_id})
+
+    @staticmethod
+    def legacy_event_and_claim() -> tuple[CodingJobRequested, WorkerClaim]:
+        bound_payload = coding_event()
+        legacy_payload = dict(bound_payload)
+        for field in (
+            "profileVersionId",
+            "pipelineAttempt",
+            "executionAttempt",
+            "workspaceId",
+            "toolCallId",
+        ):
+            legacy_payload.pop(field)
+        event = CodingJobRequested.from_dict(legacy_payload)
+        claim = WorkerClaim.from_dict(
+            worker_claim(bound_payload), event, now=FIXED_NOW
+        )
+        return event, claim
+
     def test_claim_retries_with_bounded_exponential_backoff(self) -> None:
         event, worker, heartbeat, delays, loop = self.build(failures=2)
 
-        acknowledged = loop.process(event)
+        acknowledged = loop.process(self.job(event))
 
         self.assertTrue(acknowledged)
         self.assertEqual(3, worker.claim_calls)
         self.assertEqual([1, 2], delays)
         self.assertEqual(1, len(heartbeat.started))
         self.assertEqual([event.job_id], heartbeat.stopped)
+        self.assertEqual("WAITING_APPROVAL", worker.outcomes[0][0])
 
     def test_retryable_graph_failure_reports_retry_or_permanent_by_attempt(self) -> None:
         failure = GraphExecutionError(
@@ -133,7 +182,7 @@ class WorkerLoopTest(unittest.TestCase):
         )
         graph = _Graph(failure=failure)
         event, worker, _, _, loop = self.build(graph=graph)
-        self.assertTrue(loop.process(event))
+        self.assertTrue(loop.process(self.job(event)))
         self.assertEqual("RETRYABLE_FAILURE", worker.outcomes[0][0])
         self.assertEqual("TOOL_EXECUTOR_UNAVAILABLE", worker.outcomes[0][2])
 
@@ -144,33 +193,44 @@ class WorkerLoopTest(unittest.TestCase):
         final_event, final_worker, _, _, final_loop = self.build(
             final_payload, graph=final_graph
         )
-        self.assertTrue(final_loop.process(final_event))
+        self.assertTrue(final_loop.process(self.job(final_event)))
         self.assertEqual("PERMANENT_FAILURE", final_worker.outcomes[0][0])
 
-    def test_checkpoint_duplicate_is_discarded_before_claim(self) -> None:
-        event, worker, _, _, loop = self.build(graph=_Graph(duplicate=True))
+    def test_legacy_checkpoint_duplicate_is_discarded_before_claim(self) -> None:
+        event, claim = self.legacy_event_and_claim()
+        worker = _WorkerApi(event, claim)
+        loop = WorkerLoop(
+            _UnusedQueue(),
+            worker,
+            _Graph(duplicate=True),
+            _Heartbeat(),
+            HealthState(),
+            queue_block_seconds=1,
+            max_attempts=1,
+            max_backoff_seconds=1,
+            sleeper=lambda _delay: None,
+        )
 
-        self.assertTrue(loop.process(event))
+        self.assertTrue(loop.process(self.job(event)))
 
+        self.assertEqual(1, worker.resolve_calls)
         self.assertEqual(0, worker.claim_calls)
 
     def test_duplicate_probe_failure_is_requeued_without_claim(self) -> None:
         graph = _Graph(duplicate_failure=RuntimeError("fixture probe failure"))
         event, worker, heartbeat, _, loop = self.build(graph=graph)
 
-        self.assertFalse(loop.process(event))
+        self.assertFalse(loop.process(self.job(event)))
         self.assertEqual(0, worker.claim_calls)
         self.assertEqual([], heartbeat.started)
 
-    def test_run_acks_duplicate_but_requeues_unclaimed_delivery(self) -> None:
-        event = CodingJobRequested.from_dict(coding_event())
-        delivery = QueueDelivery(event=event, _raw=event.to_json())
-        claim = WorkerClaim.from_dict(
-            worker_claim(event.to_dict()), event, now=FIXED_NOW
-        )
+    def test_run_acks_legacy_duplicate_but_requeues_unclaimed_delivery(self) -> None:
+        legacy_event, legacy_claim = self.legacy_event_and_claim()
+        job = self.job(legacy_event)
+        delivery = QueueDelivery(job=job, _raw=job.to_json())
 
         duplicate_queue = _RunQueue(delivery)
-        duplicate_worker = _WorkerApi(claim)
+        duplicate_worker = _WorkerApi(legacy_event, legacy_claim)
         duplicate_loop = WorkerLoop(
             duplicate_queue,
             duplicate_worker,
@@ -187,8 +247,12 @@ class WorkerLoopTest(unittest.TestCase):
         self.assertEqual([delivery], duplicate_queue.acked)
         self.assertEqual([], duplicate_queue.requeued)
 
+        event = CodingJobRequested.from_dict(coding_event())
+        claim = WorkerClaim.from_dict(
+            worker_claim(event.to_dict()), event, now=FIXED_NOW
+        )
         failed_queue = _RunQueue(delivery)
-        failed_worker = _WorkerApi(claim, failures=10)
+        failed_worker = _WorkerApi(event, claim, failures=10)
         failed_loop = WorkerLoop(
             failed_queue,
             failed_worker,
@@ -204,6 +268,71 @@ class WorkerLoopTest(unittest.TestCase):
         failed_loop.run()
         self.assertEqual([], failed_queue.acked)
         self.assertEqual([delivery], failed_queue.requeued)
+
+    def test_legacy_success_does_not_report_a_second_outcome(self) -> None:
+        event, claim = self.legacy_event_and_claim()
+        worker = _WorkerApi(event, claim)
+        graph = _Graph()
+        loop = WorkerLoop(
+            _UnusedQueue(),
+            worker,
+            graph,
+            _Heartbeat(),
+            HealthState(),
+            queue_block_seconds=1,
+            max_attempts=1,
+            max_backoff_seconds=1,
+            sleeper=lambda _delay: None,
+        )
+
+        self.assertTrue(loop.process(self.job(event)))
+        self.assertEqual(1, graph.invocations)
+        self.assertEqual([], worker.outcomes)
+
+    def test_unclaimed_worker_errors_ack_only_non_retryable_poison(self) -> None:
+        event = CodingJobRequested.from_dict(coding_event())
+        claim = WorkerClaim.from_dict(
+            worker_claim(event.to_dict()), event, now=FIXED_NOW
+        )
+        cases = (
+            ("resolve", "JOB_NOT_FOUND", 404, False, True),
+            ("resolve", "JOB_STATE_VERSION_CONFLICT", 409, False, True),
+            ("resolve", "WORKER_RESPONSE_INVALID", None, False, False),
+            ("resolve", "CODING_AGENT_NOT_AVAILABLE", None, False, False),
+            ("resolve", "JOB_NOT_FOUND", None, False, False),
+            ("resolve", "INTERNAL_TRANSIENT_ERROR", 503, True, False),
+            ("claim", "JOB_NOT_FOUND", 404, False, False),
+            ("claim", "INTERNAL_TRANSIENT_ERROR", 503, True, False),
+        )
+        for stage, code, status, retryable, acknowledged in cases:
+            with self.subTest(stage=stage, code=code, status=status):
+                failure = WorkerApiError(
+                    code,
+                    "safe failure",
+                    retryable=retryable,
+                    status=status,
+                )
+                worker = _WorkerApi(
+                    event,
+                    claim,
+                    resolve_error=failure if stage == "resolve" else None,
+                    claim_error=failure if stage == "claim" else None,
+                )
+                heartbeat = _Heartbeat()
+                loop = WorkerLoop(
+                    _UnusedQueue(),
+                    worker,
+                    _Graph(),
+                    heartbeat,
+                    HealthState(),
+                    queue_block_seconds=1,
+                    max_attempts=1,
+                    max_backoff_seconds=1,
+                    sleeper=lambda _delay: None,
+                )
+
+                self.assertEqual(acknowledged, loop.process(self.job(event)))
+                self.assertEqual([], heartbeat.started)
 
 
 if __name__ == "__main__":

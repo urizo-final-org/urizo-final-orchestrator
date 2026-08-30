@@ -4,17 +4,21 @@ Python LangGraph coding-agent runtime repository for AX Module Studio.
 
 ## Current state
 
-The local/full-profile runtime has one persistent LangGraph:
+The local/full-profile runtime consumes one Spring-owned Job reference at a time:
 
 1. Atomically `BLMOVE RIGHT -> LEFT` from `axms:coding:jobs:v1` to its
-   versioned processing list and strictly validate the Backend-owned
-   `CODING_JOB_REQUESTED` envelope.
-2. Claim the authoritative Spring Job lease and start bounded heartbeats.
-3. Ask Spring Model Turn for one `read_file` candidate.
-4. Submit that candidate to the Spring Tool Gateway; Python never opens the
+   versioned processing list and strictly validate the exact `{jobId}` payload.
+2. Resolve the authoritative Job execution projection from Spring, including
+   the immutable `profileVersionId`, then suppress checkpoint duplicates.
+3. Claim the authoritative Spring Job lease and start bounded heartbeats.
+4. Resolve that exact Profile Version Snapshot from Spring and select the
+   Snapshot runner for profile-bound Jobs.
+5. Ask Spring Model Turn for one `read_file` candidate on the preserved legacy
+   compatibility path.
+6. Submit that candidate to the Spring Tool Gateway; Python never opens the
    repository or executes a Tool.
-5. Persist an encrypted checkpoint, report `WAITING_APPROVAL`, and interrupt.
-6. Resume the same `thread_id == jobId` from a new Spring-approved claim and
+7. Persist an encrypted checkpoint, report `WAITING_APPROVAL`, and interrupt.
+8. Resume the same `thread_id == jobId` from a new Spring-approved claim and
    report `COMPLETED`.
 
 Spring/Core PostgreSQL remains authoritative for actors, projects,
@@ -31,22 +35,29 @@ IDs remain stable across worker-lease replacement. Event IDs and
 `jobId + expectedStateVersion` are kept in the checkpoint ledger so duplicate
 queue delivery does not repeat completed graph work.
 
-The processing-list entry is acknowledged only after `WAITING_APPROVAL`,
-`COMPLETED`, or a failure outcome is accepted by Spring. Unclaimed work is
-atomically requeued, and startup moves stale processing entries back to the
-source list in oldest-first order. The queue payload is never rewritten, so the
-strict Backend event remains the sole delivery contract.
+The processing-list entry is acknowledged after `WAITING_APPROVAL`, `COMPLETED`,
+or a failure outcome is accepted by Spring. A terminal or invalid Job reference
+rejected before claim is also acknowledged as poison; only retryable pre-claim
+failures are atomically requeued. Startup moves stale processing entries back to
+the source list in oldest-first order. The queue never contains Snapshot,
+Profile, or execution context; Spring's authenticated Job projection is the
+sole authority for those values. A profile-bound terminal checkpoint replays
+its Spring claim and success outcome without invoking its handlers again when
+the prior outcome response was not accepted.
 
 An immutable Versioned Profile Snapshot contract now validates `nodes`,
 `edges`, `config`, `handlerKey`, declared Result Ports, mandatory locked
 Guardrail passage, and bounded loop declarations. A source-only Node Registry,
 immutable Node Invocation/Result contracts, and an in-memory Graph Builder can
 compile those validated Snapshots with exact Node Type/Port binding and bounded
-loop enforcement. An injected execution provider and Worker-compatible Snapshot
+loop enforcement. The Spring execution provider and Worker-compatible Snapshot
 Runner preserve `thread_id == jobId`, checkpoint idempotency, failed-node retry,
-and approval interrupt/resume for fixture handlers. The production service still
-uses the current Coding runner through its compatibility Adapter; Spring Profile
-lookup and live Snapshot selection are not connected yet.
+and approval interrupt/resume. Profile-bound Jobs now use this production path
+and the AI06-007 Profile Version client. The production Node Registry
+intentionally has no fixture handlers, so an unregistered handler fails closed
+after claim and is reported through the existing outcome contract. The current
+Coding runner remains available behind its compatibility Adapter for legacy
+regression only.
 
 `/health/live` reports process liveness. `/health/ready` dynamically probes the
 Checkpoint DB, Valkey, and Spring on every request and returns `503` if any
@@ -95,12 +106,14 @@ $env:PYTHONPATH = 'src'
 uv run --frozen python -B -m unittest discover -s tests -v
 ```
 
-Tests cover immutable Versioned Snapshot loading and validation, Registry and
+Tests cover exact Job-reference queue and Spring execution-projection binding,
+immutable Versioned Snapshot loading and validation, Registry and
 Graph Builder linear/branch/bounded-loop contracts, Snapshot Runner checkpoint
 compatibility, Backend golden Model Turn payloads, exact-origin and credential
 handling, queue/claim/lease contracts, Tool request/result binding, encrypted
 serialization, persistent interrupt/resume, duplicate suppression,
-retry/backoff, lease loss, and dynamic dependency readiness.
+retry/backoff, terminal poison acknowledgement, lease loss, and dynamic
+dependency readiness.
 
 The Backend repository owns the primary local/full-profile acceptance. Run
 these commands from the sibling `urizo-final-backend` repository after the
@@ -120,8 +133,8 @@ bounded dependency failure/recovery checks.
 
 Latest verified Orchestrator evidence:
 
-- Python contract/runtime suite: 96 of 96 tests passed.
-- Syntax gate: 34 Python files parsed successfully.
+- Python contract/runtime suite: 112 of 112 tests passed.
+- Syntax gate: 38 Python files parsed successfully.
 - The frozen `uv.lock` image built with Python 3.12.13 and ran as non-root UID
   10001.
 - Full Compose `coding-runtime` returned HTTP 200 from both `/health/live` and

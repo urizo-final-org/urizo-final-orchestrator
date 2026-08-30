@@ -8,7 +8,11 @@ from unittest.mock import Mock
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import interrupt
 
-from axms_coding_orchestrator.contracts import CodingJobRequested, WorkerClaim
+from axms_coding_orchestrator.contracts import (
+    CodingJobRequested,
+    QueuedJobReference,
+    WorkerClaim,
+)
 from axms_coding_orchestrator.graph import CodingGraphRunner, GraphExecutionError
 from axms_coding_orchestrator.graph_builder import SnapshotGraphBuilder
 from axms_coding_orchestrator.node_runtime import (
@@ -20,10 +24,12 @@ from axms_coding_orchestrator.service import HealthState, WorkerLoop
 from axms_coding_orchestrator.snapshot import VersionedSnapshot
 from axms_coding_orchestrator.snapshot_runner import (
     CodingGraphRunnerAdapter,
+    ProfileBoundWorkerGraphRouter,
     SnapshotExecution,
     SnapshotGraphRunner,
     WorkerGraphRunner,
 )
+from axms_coding_orchestrator.worker_api import WorkerApiError
 
 from factories import FIXED_NOW, coding_event, worker_claim
 
@@ -297,21 +303,24 @@ class _UnusedQueue:
     pass
 
 
-class _NeverClaimWorker:
-    def __init__(self) -> None:
-        self.claim_calls = 0
-
-    def claim(self, event: CodingJobRequested) -> WorkerClaim:
-        del event
-        self.claim_calls += 1
-        raise AssertionError("a duplicate delivery must not be claimed")
-
-
 class _OutcomeWorker:
-    def __init__(self, claim: WorkerClaim) -> None:
+    def __init__(
+        self,
+        event: CodingJobRequested,
+        claim: WorkerClaim,
+        *,
+        outcome_failures: int = 0,
+    ) -> None:
+        self.event = event
         self.authoritative_claim = claim
+        self.outcome_failures = outcome_failures
         self.claim_calls = 0
         self.outcomes: list[tuple[str, str | None]] = []
+        self.outcome_keys: list[str] = []
+
+    def resolve(self, job: QueuedJobReference) -> CodingJobRequested:
+        assert job.job_id == self.event.job_id
+        return self.event
 
     def claim(self, event: CodingJobRequested) -> WorkerClaim:
         del event
@@ -326,8 +335,16 @@ class _OutcomeWorker:
         *,
         error_code: str | None = None,
     ) -> dict[str, Any]:
-        del claim, idempotency_key
+        del claim
         self.outcomes.append((outcome, error_code))
+        self.outcome_keys.append(idempotency_key)
+        if self.outcome_failures > 0:
+            self.outcome_failures -= 1
+            raise WorkerApiError(
+                "INTERNAL_TRANSIENT_ERROR",
+                "safe transient outcome failure",
+                retryable=True,
+            )
         return {}
 
 
@@ -347,7 +364,7 @@ class _Heartbeat:
 
 
 class SnapshotRunnerCompatibilityTest(unittest.TestCase):
-    def test_terminal_delivery_uses_job_thread_and_suppresses_exact_or_stale(
+    def test_terminal_delivery_replays_outcome_without_rerunning_handlers(
         self,
     ) -> None:
         snapshot = _linear_snapshot()
@@ -392,7 +409,7 @@ class SnapshotRunnerCompatibilityTest(unittest.TestCase):
         )
         self.assertFalse(runner.is_duplicate(future))
 
-        worker = _NeverClaimWorker()
+        worker = _OutcomeWorker(event, _claim(event), outcome_failures=1)
         heartbeat = _Heartbeat()
         loop = WorkerLoop(
             _UnusedQueue(),
@@ -405,9 +422,22 @@ class SnapshotRunnerCompatibilityTest(unittest.TestCase):
             max_backoff_seconds=1,
             sleeper=lambda _delay: None,
         )
-        self.assertTrue(loop.process(event))
-        self.assertEqual(0, worker.claim_calls)
-        self.assertEqual([], heartbeat.started)
+        job = QueuedJobReference.from_dict({"jobId": event.job_id})
+
+        self.assertFalse(loop.process(job))
+        self.assertTrue(loop.process(job))
+
+        self.assertEqual(2, worker.claim_calls)
+        self.assertEqual(
+            [("COMPLETED", None), ("COMPLETED", None)],
+            worker.outcomes,
+        )
+        self.assertEqual(1, len(set(worker.outcome_keys)))
+        self.assertEqual(
+            ["fixture.start", "fixture.guardrail", "fixture.work", "fixture.end"],
+            [name for name, _ in log],
+        )
+        self.assertEqual([event.job_id, event.job_id], heartbeat.started)
 
     def test_permanent_snapshot_contract_failure_is_reported_after_claim(self) -> None:
         snapshot = _linear_snapshot()
@@ -415,7 +445,7 @@ class SnapshotRunnerCompatibilityTest(unittest.TestCase):
             _Provider(_execution(snapshot)), NodeRegistry(), InMemorySaver()
         )
         event = _event()
-        worker = _OutcomeWorker(_claim(event))
+        worker = _OutcomeWorker(event, _claim(event))
         heartbeat = _Heartbeat()
         loop = WorkerLoop(
             _UnusedQueue(),
@@ -429,7 +459,9 @@ class SnapshotRunnerCompatibilityTest(unittest.TestCase):
             sleeper=lambda _delay: None,
         )
 
-        self.assertTrue(loop.process(event))
+        self.assertTrue(
+            loop.process(QueuedJobReference.from_dict({"jobId": event.job_id}))
+        )
         self.assertEqual(1, worker.claim_calls)
         self.assertEqual(
             [("PERMANENT_FAILURE", "CONTRACT_VALIDATION_FAILED")],
@@ -882,6 +914,37 @@ class SnapshotRunnerCompatibilityTest(unittest.TestCase):
         self.assertEqual({"status": "fixture"}, adapter.invoke(event, claim))
         legacy.is_duplicate.assert_called_once_with(event)
         legacy.invoke.assert_called_once_with(event, claim)
+
+    def test_profile_bound_router_selects_snapshot_and_preserves_legacy(self) -> None:
+        bound = _event()
+        legacy_payload = bound.to_dict()
+        for field in (
+            "profileVersionId",
+            "pipelineAttempt",
+            "executionAttempt",
+            "workspaceId",
+            "toolCallId",
+        ):
+            legacy_payload.pop(field)
+        legacy_event = CodingJobRequested.from_dict(legacy_payload)
+        claim = _claim(bound)
+        legacy = Mock()
+        snapshot = Mock()
+        legacy.is_duplicate.return_value = False
+        snapshot.is_duplicate.return_value = True
+        snapshot.invoke.return_value = {"status": "COMPLETED"}
+        router = ProfileBoundWorkerGraphRouter(legacy, snapshot)
+
+        self.assertTrue(router.is_duplicate(bound))
+        self.assertFalse(router.is_duplicate(legacy_event))
+        self.assertEqual(
+            {"status": "COMPLETED"},
+            router.invoke(bound, claim),
+        )
+        snapshot.is_duplicate.assert_called_once_with(bound)
+        legacy.is_duplicate.assert_called_once_with(legacy_event)
+        snapshot.invoke.assert_called_once_with(bound, claim)
+        legacy.invoke.assert_not_called()
 
 
 if __name__ == "__main__":

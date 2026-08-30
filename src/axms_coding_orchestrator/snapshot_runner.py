@@ -51,6 +51,38 @@ class CodingGraphRunnerAdapter:
         return self._runner.invoke(event, claim)
 
 
+class ProfileBoundWorkerGraphRouter:
+    """Route only Spring profile-bound Jobs to the Snapshot production path."""
+
+    __slots__ = ("_legacy", "_snapshot")
+
+    def __init__(
+        self,
+        legacy: WorkerGraphRunner,
+        snapshot: WorkerGraphRunner,
+    ) -> None:
+        for name, runner in (("legacy", legacy), ("snapshot", snapshot)):
+            if not callable(getattr(runner, "is_duplicate", None)) or not callable(
+                getattr(runner, "invoke", None)
+            ):
+                raise TypeError(f"{name} must implement the WorkerGraphRunner contract")
+        self._legacy = legacy
+        self._snapshot = snapshot
+
+    def is_duplicate(self, event: CodingJobRequested) -> bool:
+        return self._select(event).is_duplicate(event)
+
+    def invoke(
+        self, event: CodingJobRequested, claim: WorkerClaim
+    ) -> Mapping[str, Any]:
+        return self._select(event).invoke(event, claim)
+
+    def _select(self, event: CodingJobRequested) -> WorkerGraphRunner:
+        if not isinstance(event, CodingJobRequested):
+            raise TypeError("event must be a CodingJobRequested")
+        return self._snapshot if event.is_profile_bound else self._legacy
+
+
 class SnapshotExecutionProvider(Protocol):
     """Resolve a fixture or future Spring-owned execution by immutable job ID."""
 
@@ -218,7 +250,7 @@ class SnapshotGraphRunner:
             if same_delivery:
                 _validate_recovered_delivery(values, event, claim, execution)
                 if phase in {"WAITING_APPROVAL", "COMPLETED"}:
-                    raise _state_conflict("The Snapshot delivery is already finalized.")
+                    return {**dict(values), "status": phase}
                 graph.update_state(
                     config,
                     _execution_updates(event, claim, execution, ledger),

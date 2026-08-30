@@ -4,7 +4,12 @@ import os
 
 os.environ["LANGGRAPH_STRICT_MSGPACK"] = "true"
 
-from .contracts import CodingJobRequested, ClaimSnapshot, WorkerClaim
+from .contracts import (
+    ClaimSnapshot,
+    CodingJobRequested,
+    QueuedJobReference,
+    WorkerClaim,
+)
 from .graph import CodingGraphRunner, GraphDependencies, build_coding_graph
 
 from .model_gateway import (
@@ -42,6 +47,7 @@ from .graph_builder import (
 )
 from .snapshot_runner import (
     CodingGraphRunnerAdapter,
+    ProfileBoundWorkerGraphRouter,
     SnapshotExecution,
     SnapshotExecutionProvider,
     SnapshotGraphRunner,
@@ -73,6 +79,8 @@ __all__ = [
     "NodeResult",
     "ProfileVersionClient",
     "ProfileVersionClientError",
+    "ProfileBoundWorkerGraphRouter",
+    "QueuedJobReference",
     "SnapshotGraphBuildError",
     "SnapshotGraphBuilder",
     "SnapshotGraphExecutionError",

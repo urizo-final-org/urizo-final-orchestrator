@@ -8,7 +8,6 @@ from axms_coding_orchestrator.contracts import CodingJobRequested
 from axms_coding_orchestrator.graph import GraphExecutionError
 from axms_coding_orchestrator.profile_version_client import ProfileVersionClientError
 from axms_coding_orchestrator.snapshot import VersionedSnapshot
-from axms_coding_orchestrator.snapshot_runner import SnapshotExecution
 from axms_coding_orchestrator.spring_snapshot_provider import (
     SpringSnapshotExecutionProvider,
 )
@@ -28,27 +27,6 @@ def _snapshot(*, version: int) -> VersionedSnapshot:
     return VersionedSnapshot.from_dict(payload)
 
 
-def _execution(snapshot: VersionedSnapshot) -> SnapshotExecution:
-    return SnapshotExecution.create(
-        snapshot,
-        pipeline_attempt=2,
-        execution_attempt=3,
-        context={"approved": {"paths": ["src"]}},
-        workspace_id=WORKSPACE_ID,
-        tool_call_id=TOOL_CALL_ID,
-    )
-
-
-class _Bindings:
-    def __init__(self, value: object) -> None:
-        self.value = value
-        self.events: list[CodingJobRequested] = []
-
-    def resolve(self, event: CodingJobRequested) -> object:
-        self.events.append(event)
-        return self.value
-
-
 class _Client:
     def __init__(self, value: object) -> None:
         self.value = value
@@ -62,27 +40,27 @@ class _Client:
 
 
 class SpringSnapshotExecutionProviderTest(unittest.TestCase):
-    def test_replaces_only_snapshot_and_preserves_execution_binding(self) -> None:
-        event = CodingJobRequested.from_dict(coding_event())
-        binding = _execution(_snapshot(version=1))
+    def test_resolves_snapshot_from_the_spring_job_binding(self) -> None:
+        payload = coding_event(attempt=3)
+        payload["pipelineAttempt"] = 2
+        payload["workspaceId"] = WORKSPACE_ID
+        payload["toolCallId"] = TOOL_CALL_ID
+        event = CodingJobRequested.from_dict(payload)
         remote = _snapshot(version=2)
-        bindings = _Bindings(binding)
         client = _Client(remote)
 
-        resolved = SpringSnapshotExecutionProvider(bindings, client).resolve(event)
+        resolved = SpringSnapshotExecutionProvider(client).resolve(event)
 
         self.assertIs(remote, resolved.snapshot)
         self.assertEqual(2, resolved.pipeline_attempt)
         self.assertEqual(3, resolved.execution_attempt)
         self.assertEqual(WORKSPACE_ID, resolved.workspace_id)
         self.assertEqual(TOOL_CALL_ID, resolved.tool_call_id)
-        self.assertEqual(binding.context, resolved.context)
-        self.assertEqual([event], bindings.events)
+        self.assertEqual(event.job_payload, resolved.context)
         self.assertEqual([PROFILE_VERSION_ID], client.profile_ids)
 
     def test_client_failures_map_to_existing_worker_error_contract(self) -> None:
         event = CodingJobRequested.from_dict(coding_event())
-        binding = _execution(_snapshot(version=1))
         cases = (
             (
                 ProfileVersionClientError(
@@ -128,26 +106,30 @@ class SpringSnapshotExecutionProviderTest(unittest.TestCase):
         )
         for source, code, retryable in cases:
             with self.subTest(source=source.code):
-                provider = SpringSnapshotExecutionProvider(
-                    _Bindings(binding),
-                    _Client(source),
-                )
+                provider = SpringSnapshotExecutionProvider(_Client(source))
                 with self.assertRaises(GraphExecutionError) as raised:
                     provider.resolve(event)
                 self.assertEqual(code, raised.exception.code)
                 self.assertEqual(retryable, raised.exception.retryable)
                 self.assertNotIn("private", str(raised.exception))
 
-    def test_invalid_injected_binding_and_client_result_fail_closed(self) -> None:
+    def test_unbound_job_and_invalid_client_result_fail_closed(self) -> None:
         event = CodingJobRequested.from_dict(coding_event())
-        cases = (
-            (_Bindings(object()), _Client(_snapshot(version=1))),
-            (_Bindings(_execution(_snapshot(version=1))), _Client(object())),
-        )
-        for bindings, client in cases:
-            with self.subTest(value=type(bindings.value).__name__):
+        legacy_payload = event.to_dict()
+        for field in (
+            "profileVersionId",
+            "pipelineAttempt",
+            "executionAttempt",
+            "workspaceId",
+            "toolCallId",
+        ):
+            legacy_payload.pop(field)
+        legacy = CodingJobRequested.from_dict(legacy_payload)
+        cases = ((legacy, _Client(_snapshot(version=1))), (event, _Client(object())))
+        for source, client in cases:
+            with self.subTest(bound=source.is_profile_bound):
                 with self.assertRaises(GraphExecutionError) as raised:
-                    SpringSnapshotExecutionProvider(bindings, client).resolve(event)
+                    SpringSnapshotExecutionProvider(client).resolve(source)
                 self.assertEqual("CONTRACT_VALIDATION_FAILED", raised.exception.code)
                 self.assertFalse(raised.exception.retryable)
 
