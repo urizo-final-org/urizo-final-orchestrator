@@ -14,6 +14,12 @@ import time
 from typing import Any, Callable
 
 from .checkpoint import CheckpointError, CheckpointRuntime
+from .coding_domain_client import SpringCodingDomainClient
+from .coding_handlers import (
+    CodingHandlerDependencies,
+    PreparedResultCodingStageExecutor,
+    register_coding_node_handlers,
+)
 from .common_handlers import build_common_node_registry
 from .config import ConfigurationError, RuntimeSettings
 from .contracts import CodingJobRequested, QueuedJobReference, WorkerClaim
@@ -431,11 +437,21 @@ def main() -> None:
                 )
             )
         )
+        production_registry = register_coding_node_handlers(
+            build_common_node_registry(),
+            CodingHandlerDependencies(
+                domain_client=SpringCodingDomainClient(
+                    settings.spring_origin,
+                    credential_resolver,
+                ),
+                executor=PreparedResultCodingStageExecutor(),
+            ),
+        )
         snapshot_graph = SnapshotGraphRunner(
             SpringSnapshotExecutionProvider(
                 ProfileVersionClient(settings.spring_origin, credential_resolver)
             ),
-            build_common_node_registry(),
+            production_registry,
             checkpoint.checkpointer,
         )
         graph = ProfileBoundWorkerGraphRouter(legacy_graph, snapshot_graph)
