@@ -783,6 +783,54 @@ class SnapshotRunnerCompatibilityTest(unittest.TestCase):
         self.assertEqual("JOB_STATE_VERSION_CONFLICT", failure.exception.code)
         self.assertEqual(before_resume, log)
 
+    def test_resume_rejects_same_profile_id_content_drift_by_digest(self) -> None:
+        original = _interrupt_snapshot()
+        changed_payload = original.to_dict()
+        changed_payload["config"]["maxAttempts"] += 1
+        changed = VersionedSnapshot.from_dict(changed_payload)
+        log: list[tuple[str, NodeInvocation]] = []
+
+        def pause(invocation: NodeInvocation) -> NodeResult:
+            interrupt({"fixture": "pause"})
+            log.append(("fixture.pause", invocation))
+            return NodeResult.create("fixture_resumed")
+
+        handlers = {
+            "fixture.start": _fixed_handler(log, "fixture.start", "fixture_next"),
+            "fixture.guardrail": _fixed_handler(
+                log, "fixture.guardrail", "fixture_passed"
+            ),
+            "fixture.work": _fixed_handler(log, "fixture.work", "fixture_ready"),
+            "fixture.pause": pause,
+            "fixture.end": _fixed_handler(log, "fixture.end", None),
+        }
+        event = _event()
+        resume_event = _event(
+            event_id="29292929-2929-4929-8929-292929292929",
+            version=6,
+        )
+        provider = _Provider(
+            _execution(original),
+            {resume_event.event_id: _execution(changed)},
+        )
+        registry = _registry(original, handlers)
+        checkpointer = InMemorySaver()
+        runner = SnapshotGraphRunner(provider, registry, checkpointer)
+
+        runner.invoke(event, _claim(event))
+        before_resume = list(log)
+
+        with self.assertRaisesRegex(
+            GraphExecutionError, "checkpoint identity"
+        ) as failure:
+            runner.invoke(
+                resume_event,
+                _claim(resume_event, resume=True, state_version=7),
+            )
+
+        self.assertEqual("JOB_STATE_VERSION_CONFLICT", failure.exception.code)
+        self.assertEqual(before_resume, log)
+
     def test_malformed_checkpoint_ledger_is_never_treated_as_duplicate(self) -> None:
         snapshot = _linear_snapshot()
         log: list[tuple[str, NodeInvocation]] = []
