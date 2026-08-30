@@ -14,6 +14,7 @@ import time
 from typing import Any, Callable
 
 from .checkpoint import CheckpointError, CheckpointRuntime
+from .common_handlers import build_common_node_registry
 from .config import ConfigurationError, RuntimeSettings
 from .contracts import CodingJobRequested, QueuedJobReference, WorkerClaim
 from .graph import (
@@ -29,7 +30,6 @@ from .model_gateway import (
     ModelGatewayClient,
     ModelGatewayRemoteError,
 )
-from .node_runtime import NodeRegistry
 from .profile_version_client import ProfileVersionClient
 from .queue import QueueError, ValkeyJobQueue
 from .snapshot_runner import (
@@ -435,7 +435,7 @@ def main() -> None:
             SpringSnapshotExecutionProvider(
                 ProfileVersionClient(settings.spring_origin, credential_resolver)
             ),
-            NodeRegistry(),
+            build_common_node_registry(),
             checkpoint.checkpointer,
         )
         graph = ProfileBoundWorkerGraphRouter(legacy_graph, snapshot_graph)

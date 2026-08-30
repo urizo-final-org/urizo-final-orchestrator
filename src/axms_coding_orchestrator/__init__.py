@@ -45,6 +45,7 @@ from .graph_builder import (
     SnapshotGraphBuilder,
     SnapshotGraphExecutionError,
 )
+from .common_handlers import build_common_node_registry
 from .snapshot_runner import (
     CodingGraphRunnerAdapter,
     ProfileBoundWorkerGraphRouter,
@@ -101,6 +102,7 @@ __all__ = [
     "WorkerClaim",
     "WorkerGraphRunner",
     "build_coding_graph",
+    "build_common_node_registry",
     "load_snapshot_json",
     "validate_snapshot",
 ]
