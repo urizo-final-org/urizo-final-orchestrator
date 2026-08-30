@@ -53,6 +53,7 @@ from .coding_domain_client import (
     CodingPendingApproval,
     CodingResultRecord,
     CodingResultWrite,
+    CodingStageExecutionResult,
     SpringCodingDomainClient,
 )
 from .coding_handlers import (
@@ -61,6 +62,7 @@ from .coding_handlers import (
     CodingHandlerFailure,
     CodingStageOutcome,
     PreparedResultCodingStageExecutor,
+    SpringGatewayCodingStageExecutor,
     register_coding_node_handlers,
 )
 from .default_coding_snapshot import (
@@ -99,6 +101,7 @@ __all__ = [
     "CodingPendingApproval",
     "CodingResultRecord",
     "CodingResultWrite",
+    "CodingStageExecutionResult",
     "CodingStageOutcome",
     "ClaimSnapshot",
     "FileServiceCredentialResolver",
@@ -135,6 +138,7 @@ __all__ = [
     "SnapshotNode",
     "SpringSnapshotExecutionProvider",
     "SpringCodingDomainClient",
+    "SpringGatewayCodingStageExecutor",
     "ToolExecutionResult",
     "ToolGatewayClient",
     "VersionedSnapshot",

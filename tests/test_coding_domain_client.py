@@ -11,6 +11,7 @@ from axms_coding_orchestrator.coding_domain_client import (
     CodingAttemptAggregate,
     CodingDomainClientError,
     CodingResultWrite,
+    CodingStageExecutionResult,
     SpringCodingDomainClient,
 )
 from axms_coding_orchestrator.model_gateway import ServiceCredentialLease
@@ -44,6 +45,9 @@ class _CodingHandler(BaseHTTPRequestHandler):
         type(self).observed_trace_id = self.headers.get("X-Trace-Id")
         type(self).observed_body = json.loads(self.rfile.read(length))
         self._respond()
+
+    def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
+        self.do_PUT()
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
         type(self).observed_path = self.path
@@ -151,6 +155,20 @@ def _aggregate_response() -> dict[str, object]:
             }
         ],
         "createdAt": NOW,
+    }
+
+
+def _stage_execution_response() -> dict[str, object]:
+    return {
+        "schemaVersion": "1.0",
+        "resultId": RESULT_ID,
+        "handlerKey": "coding.preview",
+        "resultPort": "ready",
+        "workspaceId": WORKSPACE_ID,
+        "candidateSha": SHA,
+        "diffDigest": DIGEST,
+        "validationHash": DIGEST,
+        "payload": {"status": "READY"},
     }
 
 
@@ -285,6 +303,38 @@ class SpringCodingDomainClientTest(unittest.TestCase):
         )
         self.assertEqual(TRACE_ID, _CodingHandler.observed_trace_id)
         self.assertEqual("ready", _CodingHandler.observed_body["resultPort"])
+
+    def test_execute_stage_posts_the_exact_authoritative_invocation(self) -> None:
+        with _coding_server(_stage_execution_response()) as origin:
+            client = SpringCodingDomainClient(
+                origin, self._credential, allowed_origins={origin}
+            )
+            result = client.execute_stage(
+                _invocation(), "coding.preview", RESULT_ID
+            )
+
+        self.assertIsInstance(result, CodingStageExecutionResult)
+        self.assertEqual("ready", result.result_port)
+        self.assertEqual(
+            f"/internal/coding/worker/jobs/{JOB_ID}/attempts/2/stages/"
+            f"coding.preview/executions/{RESULT_ID}",
+            _CodingHandler.observed_path,
+        )
+        self.assertEqual(
+            {
+                "schemaVersion": "1.0",
+                "traceId": TRACE_ID,
+                "expectedStateVersion": 7,
+                "executionAttempt": 3,
+                "handlerKey": "coding.preview",
+                "resultId": RESULT_ID,
+            },
+            _CodingHandler.observed_body,
+        )
+        self.assertEqual(
+            "Bearer spring-service-test-token", _CodingHandler.observed_authorization
+        )
+        self.assertEqual(TRACE_ID, _CodingHandler.observed_trace_id)
 
     def test_real_get_maps_correlated_error_envelope_and_sends_trace_header(self) -> None:
         response = {

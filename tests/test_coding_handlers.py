@@ -9,12 +9,14 @@ from axms_coding_orchestrator.coding_domain_client import (
     CodingAttemptAggregate,
     CodingResultRecord,
     CodingResultWrite,
+    CodingStageExecutionResult,
 )
 from axms_coding_orchestrator.coding_handlers import (
     CodingHandlerDependencies,
     CodingHandlerFailure,
     CodingStageOutcome,
     PreparedResultCodingStageExecutor,
+    SpringGatewayCodingStageExecutor,
     register_coding_node_handlers,
 )
 from axms_coding_orchestrator.graph import GraphExecutionError
@@ -230,7 +232,45 @@ class _FixedExecutor:
         return self.outcome
 
 
+class _GatewayDomain(_Domain):
+    def __init__(self, attempt: CodingAttemptAggregate) -> None:
+        super().__init__(attempt)
+        self.stage_calls: list[tuple[str, str]] = []
+
+    def execute_stage(
+        self, invocation: NodeInvocation, handler_key: str, result_id: str
+    ) -> CodingStageExecutionResult:
+        del invocation
+        self.stage_calls.append((handler_key, result_id))
+        return CodingStageExecutionResult(
+            result_id=result_id,
+            handler_key=handler_key,
+            result_port="feasible",
+            workspace_id=WORKSPACE_ID,
+            payload={"summary": "bounded model/tool stage completed"},
+        )
+
+
 class CodingStageHandlerTest(unittest.TestCase):
+    def test_spring_gateway_stage_is_recorded_through_existing_result_api(self) -> None:
+        domain = _GatewayDomain(_aggregate())
+        handler = register_coding_node_handlers(
+            NodeRegistry(),
+            CodingHandlerDependencies(
+                domain,
+                SpringGatewayCodingStageExecutor(domain),
+            ),
+        ).resolve("coding.analyze").handler
+
+        result = handler(_invocation("analyze"))
+
+        self.assertEqual("feasible", result.port)
+        self.assertEqual(1, len(domain.stage_calls))
+        self.assertEqual("coding.analyze", domain.stage_calls[0][0])
+        self.assertEqual(domain.stage_calls[0][1], domain.writes[0].result_id)
+        self.assertEqual("ANALYSIS", domain.writes[0].result_type)
+        self.assertEqual("feasible", domain.writes[0].result_port)
+
     def test_result_id_is_stable_across_technical_attempt_and_changes_by_round(
         self,
     ) -> None:

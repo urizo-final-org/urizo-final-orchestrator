@@ -152,6 +152,35 @@ class PreparedResultCodingStageExecutor:
 
 
 @dataclass(frozen=True, slots=True)
+class SpringGatewayCodingStageExecutor:
+    """Execute one AI04 stage through Spring's bounded Model/Tool boundary."""
+
+    domain_client: CodingDomainClient
+
+    def __post_init__(self) -> None:
+        if not callable(getattr(self.domain_client, "execute_stage", None)):
+            raise TypeError("domain_client must implement execute_stage")
+
+    def execute(
+        self,
+        handler_key: str,
+        invocation: NodeInvocation,
+        attempt: CodingAttemptAggregate,
+        result_id: str,
+    ) -> CodingStageOutcome:
+        del attempt
+        result = self.domain_client.execute_stage(invocation, handler_key, result_id)
+        return CodingStageOutcome(
+            port=result.result_port,
+            workspace_id=result.workspace_id,
+            candidate_sha=result.candidate_sha,
+            diff_digest=result.diff_digest,
+            validation_hash=result.validation_hash,
+            payload=result.payload,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class CodingHandlerDependencies:
     domain_client: CodingDomainClient
     executor: CodingStageExecutor

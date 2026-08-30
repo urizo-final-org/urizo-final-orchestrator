@@ -131,6 +131,64 @@ class CodingResultWrite:
 
 
 @dataclass(frozen=True, slots=True)
+class CodingStageExecutionResult:
+    result_id: str
+    handler_key: str
+    result_port: str
+    payload: Mapping[str, Any]
+    workspace_id: str | None = None
+    candidate_sha: str | None = None
+    diff_digest: str | None = None
+    validation_hash: str | None = None
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> CodingStageExecutionResult:
+        payload = _object(value, "stageExecution")
+        required = {
+            "schemaVersion",
+            "resultId",
+            "handlerKey",
+            "resultPort",
+            "payload",
+        }
+        optional = {"workspaceId", "candidateSha", "diffDigest", "validationHash"}
+        _fields(payload, required, optional, "stageExecution")
+        if payload["schemaVersion"] != "1.0":
+            raise ValueError("stageExecution.schemaVersion is invalid")
+        return cls(
+            result_id=_uuid(payload["resultId"], "stageExecution.resultId"),
+            handler_key=_matched(
+                payload["handlerKey"], HANDLER_KEY, "stageExecution.handlerKey", 128
+            ),
+            result_port=_one_of(
+                payload["resultPort"], RESULT_PORTS, "stageExecution.resultPort"
+            ),
+            payload=_json_object(payload["payload"], "stageExecution.payload"),
+            workspace_id=_optional_uuid(
+                payload.get("workspaceId"), "stageExecution.workspaceId"
+            ),
+            candidate_sha=_optional_match(
+                payload.get("candidateSha"),
+                GIT_OBJECT_ID,
+                "stageExecution.candidateSha",
+                71,
+            ),
+            diff_digest=_optional_match(
+                payload.get("diffDigest"),
+                SHA256_DIGEST,
+                "stageExecution.diffDigest",
+                71,
+            ),
+            validation_hash=_optional_match(
+                payload.get("validationHash"),
+                SHA256_DIGEST,
+                "stageExecution.validationHash",
+                71,
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class CodingResultRecord:
     result_id: str
     job_id: str
@@ -412,6 +470,10 @@ class CodingDomainClient(Protocol):
         self, invocation: NodeInvocation, result: CodingResultWrite
     ) -> CodingResultRecord: ...
 
+    def execute_stage(
+        self, invocation: NodeInvocation, handler_key: str, result_id: str
+    ) -> CodingStageExecutionResult: ...
+
 
 class SpringCodingDomainClient:
     """Read and atomically record only the current Spring Coding attempt."""
@@ -502,6 +564,36 @@ class SpringCodingDomainClient:
         ):
             raise _invalid_response()
         return recorded
+
+    def execute_stage(
+        self, invocation: NodeInvocation, handler_key: str, result_id: str
+    ) -> CodingStageExecutionResult:
+        _invocation(invocation)
+        _matched(handler_key, HANDLER_KEY, "stageExecution.handlerKey", 128)
+        _uuid(result_id, "stageExecution.resultId")
+        path = (
+            f"/internal/coding/worker/jobs/{invocation.job_id}/attempts/"
+            f"{invocation.pipeline_attempt}/stages/{handler_key}/executions/{result_id}"
+        )
+        body = {
+            "schemaVersion": "1.0",
+            "traceId": invocation.trace_id,
+            "expectedStateVersion": invocation.state_version,
+            "executionAttempt": invocation.execution_attempt,
+            "handlerKey": handler_key,
+            "resultId": result_id,
+        }
+        response = self._call("POST", path, canonical_json_bytes(body), invocation)
+        try:
+            stage_result = CodingStageExecutionResult.from_dict(response)
+        except (TypeError, ValueError, RecursionError):
+            raise _invalid_response() from None
+        if (
+            stage_result.result_id != result_id
+            or stage_result.handler_key != handler_key
+        ):
+            raise _invalid_response()
+        return stage_result
 
     def _call(
         self,
@@ -619,9 +711,9 @@ def _request_coding_http(
     timeout: float,
     trace_id: str,
 ) -> tuple[int, bytes]:
-    """Keep traced GET/PUT support local to the Coding result contract."""
+    """Keep traced GET/PUT/POST support local to the Coding result contract."""
 
-    if method not in {"GET", "PUT"} or (method == "GET") != (body is None):
+    if method not in {"GET", "PUT", "POST"} or (method == "GET") != (body is None):
         raise ContractViolation("Coding Domain HTTP method is invalid")
     try:
         _uuid(trace_id, "traceId")
