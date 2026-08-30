@@ -54,16 +54,24 @@ loop enforcement. The Spring execution provider and Worker-compatible Snapshot
 Runner preserve `thread_id == jobId`, checkpoint idempotency, failed-node retry,
 and approval interrupt/resume. Profile-bound Jobs now use this production path
 and the AI06-007 Profile Version client. The production Node Registry registers
-only the source-owned `common.start`, `common.guardrail`, `common.check`,
-`common.approval`, and `common.end` contracts. Feature handlers remain
-unregistered and fail closed through the existing outcome contract. The
-current Coding runner remains available behind its compatibility Adapter for
-legacy regression only.
+the source-owned common contracts plus the AI04 `coding.analyze`, `coding.code`,
+`coding.review`, `coding.preview`, `coding.approval`,
+`coding.preview_approval`, `coding.pr_request`, and `coding.deploy_request`
+contracts. AI04 stage handlers validate the exact Spring attempt/result shape,
+record only their current Result Port, and never choose the next node. The
+production stage executor consumes an exact Backend-prepared result and fails
+closed with `HANDLER_RESULT_NOT_FOUND` when none exists. No approved component
+currently produces the first `coding.analyze` result, so a fresh production
+AI04 Job remains blocked pending a stage execution/result-production contract;
+the injected-executor tests prove the graph contract, not production execution.
+The current Coding runner remains available behind its compatibility Adapter
+for legacy regression only.
 
 Spring marks `resume=true` only for the exact `WAITING_APPROVAL` to `RUNNING`
 approval transition. Higher `executionAttempt` deliveries are technical retries
-and cannot consume the approval interrupt; rejection remains a Spring-owned
-terminal cancellation and is not requeued to this runtime.
+and cannot consume the approval interrupt. AI04 candidate rejection can resume
+the Spring-authorized next `pipelineAttempt` within the three-attempt bound;
+other approval rejection remains a Spring-owned terminal cancellation.
 
 `/health/live` reports process liveness. `/health/ready` dynamically probes the
 Checkpoint DB, Valkey, and Spring on every request and returns `503` if any
@@ -112,7 +120,10 @@ $env:PYTHONPATH = 'src'
 uv run --frozen python -B -m unittest discover -s tests -v
 ```
 
-Tests cover exact Job-reference queue and Spring execution-projection binding,
+Tests cover AI04 handler/result contracts, code-review-preview candidate binding,
+approval subject binding, the total three-cycle review bound and
+candidate-rejection graph routes, exact Job-reference queue and Spring
+execution-projection binding,
 immutable Versioned Snapshot loading and validation, Registry and
 Graph Builder linear/branch/bounded-loop contracts, Snapshot Runner checkpoint
 compatibility, Backend golden Model Turn payloads, exact-origin and credential
@@ -139,8 +150,8 @@ bounded dependency failure/recovery checks.
 
 Latest verified Orchestrator evidence:
 
-- Python contract/runtime suite: 123 of 123 tests passed.
-- Syntax gate: 40 Python files parsed successfully.
+- Python contract/runtime suite: 149 of 149 tests passed.
+- Syntax gate: 47 Python files parsed successfully.
 - The frozen `uv.lock` image built with Python 3.12.13 and ran as non-root UID
   10001.
 - Full Compose `coding-runtime` returned HTTP 200 from both `/health/live` and
