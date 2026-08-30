@@ -47,6 +47,8 @@ from .snapshot_runner import (
     SnapshotGraphRunner,
     WorkerGraphRunner,
 )
+from .profile_version_client import ProfileVersionClient, ProfileVersionClientError
+from .spring_snapshot_provider import SpringSnapshotExecutionProvider
 from .tool_gateway import ToolExecutionResult, ToolGatewayClient
 from .worker_api import WorkerApiClient
 
@@ -69,6 +71,8 @@ __all__ = [
     "NodeRegistry",
     "NodeRegistryViolation",
     "NodeResult",
+    "ProfileVersionClient",
+    "ProfileVersionClientError",
     "SnapshotGraphBuildError",
     "SnapshotGraphBuilder",
     "SnapshotGraphExecutionError",
@@ -81,6 +85,7 @@ __all__ = [
     "SnapshotEdge",
     "SnapshotLoopLimit",
     "SnapshotNode",
+    "SpringSnapshotExecutionProvider",
     "ToolExecutionResult",
     "ToolGatewayClient",
     "VersionedSnapshot",
