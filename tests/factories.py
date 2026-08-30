@@ -19,6 +19,11 @@ def coding_event(*, event_id: str = "10101010-1010-4010-8010-101010101010", vers
         "attempt": attempt,
         "expectedStateVersion": version,
         "occurredAt": "2026-08-11T10:00:00Z",
+        "profileVersionId": "11111111-1111-4111-8111-111111111111",
+        "pipelineAttempt": 1,
+        "executionAttempt": attempt,
+        "workspaceId": None,
+        "toolCallId": None,
         "payload": {
             "actorId": "40404040-4040-4040-8040-404040404040",
             "projectId": "50505050-5050-4050-8050-505050505050",
@@ -42,6 +47,7 @@ def worker_claim(event: dict[str, Any], *, resume: bool = False, state_version: 
         "leaseExpiresAt": "2026-08-11T10:10:00Z" if not resume else "2026-08-11T10:20:00Z",
         "stateVersion": state_version if state_version is not None else event["expectedStateVersion"] + 1,
         "resume": resume,
+        "profileVersionId": event["profileVersionId"],
         "snapshot": {
             "actor": {"actorId": source["actorId"], "role": "DEVELOPER"},
             "project": {"projectId": source["projectId"]},

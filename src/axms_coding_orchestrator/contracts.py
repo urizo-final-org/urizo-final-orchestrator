@@ -29,6 +29,32 @@ class WorkerContractViolation(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class QueuedJobReference:
+    """The only payload allowed on the private coding queue."""
+
+    job_id: str
+
+    @classmethod
+    def from_json(cls, raw: bytes | str) -> QueuedJobReference:
+        return cls.from_dict(_decode_json(raw))
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> QueuedJobReference:
+        payload = _object(value, "queuedJob")
+        _exact_fields(payload, {"jobId"}, "queuedJob")
+        return cls(_uuid(payload["jobId"], "jobId"))
+
+    def to_dict(self) -> dict[str, str]:
+        return {"jobId": self.job_id}
+
+    def to_json(self) -> bytes:
+        return canonical_json_bytes(self.to_dict())
+
+    def __repr__(self) -> str:
+        return "QueuedJobReference[jobId=%s]" % self.job_id
+
+
+@dataclass(frozen=True, slots=True)
 class CodingJobRequested:
     _payload: dict[str, Any]
 
@@ -39,22 +65,31 @@ class CodingJobRequested:
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> CodingJobRequested:
         payload = _object(value, "event")
-        _exact_fields(
-            payload,
-            {
-                "schemaVersion",
-                "eventId",
-                "eventType",
-                "jobId",
-                "traceId",
-                "idempotencyKey",
-                "attempt",
-                "expectedStateVersion",
-                "occurredAt",
-                "payload",
-            },
-            "event",
-        )
+        base_fields = {
+            "schemaVersion",
+            "eventId",
+            "eventType",
+            "jobId",
+            "traceId",
+            "idempotencyKey",
+            "attempt",
+            "expectedStateVersion",
+            "occurredAt",
+            "payload",
+        }
+        binding_fields = {
+            "profileVersionId",
+            "pipelineAttempt",
+            "executionAttempt",
+            "workspaceId",
+            "toolCallId",
+        }
+        actual_fields = frozenset(payload)
+        if actual_fields not in {
+            frozenset(base_fields),
+            frozenset(base_fields | binding_fields),
+        }:
+            raise WorkerContractViolation("event contains missing or unknown fields")
         _schema_version(payload["schemaVersion"])
         if payload["eventType"] != "CODING_JOB_REQUESTED":
             raise WorkerContractViolation("eventType is unsupported by the coding queue")
@@ -64,6 +99,18 @@ class CodingJobRequested:
         _positive_integer(payload["attempt"], "attempt")
         _positive_integer(payload["expectedStateVersion"], "expectedStateVersion")
         _timestamp(payload["occurredAt"], "occurredAt")
+        if binding_fields <= set(payload):
+            _uuid(payload["profileVersionId"], "profileVersionId")
+            _positive_integer(payload["pipelineAttempt"], "pipelineAttempt")
+            execution_attempt = _positive_integer(
+                payload["executionAttempt"], "executionAttempt"
+            )
+            if execution_attempt != payload["attempt"]:
+                raise WorkerContractViolation(
+                    "executionAttempt does not match the authoritative attempt"
+                )
+            _optional_uuid(payload["workspaceId"], "workspaceId")
+            _optional_uuid(payload["toolCallId"], "toolCallId")
         job = _object(payload["payload"], "payload")
         _exact_fields(
             job,
@@ -117,6 +164,30 @@ class CodingJobRequested:
     @property
     def idempotency_key(self) -> str:
         return self._payload["idempotencyKey"]
+
+    @property
+    def is_profile_bound(self) -> bool:
+        return "profileVersionId" in self._payload
+
+    @property
+    def profile_version_id(self) -> str | None:
+        return self._payload.get("profileVersionId")
+
+    @property
+    def pipeline_attempt(self) -> int | None:
+        return self._payload.get("pipelineAttempt")
+
+    @property
+    def execution_attempt(self) -> int | None:
+        return self._payload.get("executionAttempt")
+
+    @property
+    def workspace_id(self) -> str | None:
+        return self._payload.get("workspaceId")
+
+    @property
+    def tool_call_id(self) -> str | None:
+        return self._payload.get("toolCallId")
 
     @property
     def job_payload(self) -> dict[str, Any]:
@@ -225,6 +296,7 @@ class WorkerClaim:
                 "leaseExpiresAt",
                 "stateVersion",
                 "resume",
+                "profileVersionId",
                 "snapshot",
             },
             "claim",
@@ -242,6 +314,13 @@ class WorkerClaim:
             raise WorkerContractViolation("claim stateVersion did not advance")
         if not isinstance(payload["resume"], bool):
             raise WorkerContractViolation("claim.resume is invalid")
+        _uuid(payload["profileVersionId"], "profileVersionId")
+        if event.profile_version_id is not None and (
+            payload["profileVersionId"] != event.profile_version_id
+        ):
+            raise WorkerContractViolation(
+                "claim profileVersionId does not match the authoritative job"
+            )
         snapshot = ClaimSnapshot.from_dict(payload["snapshot"])
         source = event.job_payload
         actual = snapshot.to_dict()
@@ -280,6 +359,10 @@ class WorkerClaim:
     @property
     def resume(self) -> bool:
         return self._payload["resume"]
+
+    @property
+    def profile_version_id(self) -> str:
+        return self._payload["profileVersionId"]
 
     @property
     def snapshot(self) -> ClaimSnapshot:
@@ -387,6 +470,12 @@ def _uuid(value: Any, field: str) -> str:
     except (ValueError, AttributeError):
         raise WorkerContractViolation(f"{field} is invalid") from None
     return value
+
+
+def _optional_uuid(value: Any, field: str) -> str | None:
+    if value is None:
+        return None
+    return _uuid(value, field)
 
 
 def _timestamp(value: Any, field: str) -> datetime:

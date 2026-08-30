@@ -6,6 +6,7 @@ import unittest
 from axms_coding_orchestrator.contracts import (
     ClaimSnapshot,
     CodingJobRequested,
+    QueuedJobReference,
     WorkerClaim,
     WorkerContractViolation,
 )
@@ -19,7 +20,14 @@ class CodingJobRequestedContractTest(unittest.TestCase):
         claim = WorkerClaim.from_dict(worker_claim(event.to_dict()), event, now=FIXED_NOW)
 
         self.assertEqual((event.job_id, 4), event.ledger_key())
+        self.assertEqual(
+            "11111111-1111-4111-8111-111111111111",
+            event.profile_version_id,
+        )
+        self.assertEqual(1, event.pipeline_attempt)
+        self.assertEqual(1, event.execution_attempt)
         self.assertEqual(5, claim.state_version)
+        self.assertEqual(event.profile_version_id, claim.profile_version_id)
         self.assertFalse(claim.resume)
         self.assertNotIn("Inspect only", repr(claim.snapshot))
 
@@ -37,6 +45,20 @@ class CodingJobRequestedContractTest(unittest.TestCase):
         with self.assertRaisesRegex(WorkerContractViolation, "unsupported"):
             CodingJobRequested.from_dict(payload)
 
+    def test_queue_reference_contains_only_a_canonical_job_id(self) -> None:
+        job = QueuedJobReference.from_dict(
+            {"jobId": "20202020-2020-4020-8020-202020202020"}
+        )
+
+        self.assertEqual({"jobId": job.job_id}, job.to_dict())
+        for payload in (
+            {"jobId": job.job_id, "profileVersionId": "hidden"},
+            {"jobId": "not-a-uuid"},
+        ):
+            with self.subTest(payload=payload):
+                with self.assertRaises(WorkerContractViolation):
+                    QueuedJobReference.from_dict(payload)
+
     def test_claim_scope_mismatch_and_nonadvancing_version_are_rejected(self) -> None:
         event = CodingJobRequested.from_dict(coding_event())
         mismatch = worker_claim(event.to_dict())
@@ -47,6 +69,13 @@ class CodingJobRequestedContractTest(unittest.TestCase):
         stale = worker_claim(event.to_dict(), state_version=event.expected_state_version)
         with self.assertRaisesRegex(WorkerContractViolation, "advance"):
             WorkerClaim.from_dict(stale, event, now=FIXED_NOW)
+
+        changed_profile = worker_claim(event.to_dict())
+        changed_profile["profileVersionId"] = (
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        )
+        with self.assertRaisesRegex(WorkerContractViolation, "profileVersionId"):
+            WorkerClaim.from_dict(changed_profile, event, now=FIXED_NOW)
 
     def test_snapshot_rejects_repository_escape_path(self) -> None:
         payload = worker_claim(coding_event())["snapshot"]

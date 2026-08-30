@@ -5,12 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from .contracts import CodingJobRequested, WorkerContractViolation
+from .contracts import QueuedJobReference, WorkerContractViolation
 
 
 QUEUE_KEY = "axms:coding:jobs:v1"
 PROCESSING_QUEUE_KEY = "axms:coding:jobs:v1:processing"
-MAX_EVENT_BYTES = 262_144
+MAX_JOB_REFERENCE_BYTES = 128
 
 
 class QueueError(RuntimeError):
@@ -19,11 +19,11 @@ class QueueError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class QueueDelivery:
-    event: CodingJobRequested
+    job: QueuedJobReference
     _raw: bytes = field(repr=False)
 
     def __repr__(self) -> str:
-        return "QueueDelivery[eventId=%s, payload=REDACTED]" % self.event.event_id
+        return "QueueDelivery[jobId=%s]" % self.job.job_id
 
 
 class ValkeyJobQueue:
@@ -92,15 +92,15 @@ class ValkeyJobQueue:
             raise QueueError("Valkey coding queue read failed") from None
         if raw is None:
             return None
-        if not isinstance(raw, bytes) or not 1 <= len(raw) <= MAX_EVENT_BYTES:
+        if not isinstance(raw, bytes) or not 1 <= len(raw) <= MAX_JOB_REFERENCE_BYTES:
             self._discard_poison(raw)
-            raise QueueError("Valkey coding queue event size is invalid")
+            raise QueueError("Valkey coding queue job reference size is invalid")
         try:
-            event = CodingJobRequested.from_json(raw)
+            job = QueuedJobReference.from_json(raw)
         except WorkerContractViolation:
             self._discard_poison(raw)
-            raise QueueError("Valkey coding queue event contract is invalid") from None
-        return QueueDelivery(event=event, _raw=raw)
+            raise QueueError("Valkey coding queue job reference is invalid") from None
+        return QueueDelivery(job=job, _raw=raw)
 
     def ack(self, delivery: QueueDelivery) -> None:
         client = self._require_client()

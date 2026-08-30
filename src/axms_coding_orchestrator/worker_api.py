@@ -14,6 +14,7 @@ from .contracts import (
     CodingJobRequested,
     IDEMPOTENCY_KEY,
     OUTCOMES,
+    QueuedJobReference,
     WorkerClaim,
     WorkerContractViolation,
     canonical_json_bytes,
@@ -72,6 +73,30 @@ class WorkerApiClient:
         self._credential_resolver = credential_resolver
         self._timeout_seconds = timeout_seconds
         self._now = now or (lambda: datetime.now(timezone.utc))
+
+    def resolve(self, job: QueuedJobReference) -> CodingJobRequested:
+        if not isinstance(job, QueuedJobReference):
+            raise TypeError("job must be a QueuedJobReference")
+        response = self._call(
+            "GET",
+            f"/internal/coding/worker/jobs/{job.job_id}/claim-context",
+            None,
+        )
+        try:
+            event = CodingJobRequested.from_dict(response)
+        except WorkerContractViolation:
+            raise WorkerApiError(
+                "WORKER_RESPONSE_INVALID",
+                "Spring worker claim context is invalid.",
+                retryable=False,
+            ) from None
+        if event.job_id != job.job_id or not event.is_profile_bound:
+            raise WorkerApiError(
+                "WORKER_RESPONSE_INVALID",
+                "Spring worker claim context is invalid.",
+                retryable=False,
+            )
+        return event
 
     def claim(self, event: CodingJobRequested) -> WorkerClaim:
         body = {

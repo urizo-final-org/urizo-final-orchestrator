@@ -6,7 +6,7 @@ import json
 import threading
 import unittest
 
-from axms_coding_orchestrator.contracts import CodingJobRequested
+from axms_coding_orchestrator.contracts import CodingJobRequested, QueuedJobReference
 from axms_coding_orchestrator.model_gateway import ServiceCredentialLease
 from axms_coding_orchestrator.worker_api import WorkerApiClient, WorkerApiError
 
@@ -72,6 +72,10 @@ class WorkerApiClientTest(unittest.TestCase):
         claim_payload = worker_claim(event.to_dict())
         job_id = event.job_id
         responses = {
+            f"/internal/coding/worker/jobs/{job_id}/claim-context": (
+                200,
+                event.to_dict(),
+            ),
             f"/internal/coding/worker/jobs/{job_id}/claim": (200, claim_payload),
             f"/internal/coding/worker/jobs/{job_id}/heartbeat": (
                 200,
@@ -97,15 +101,42 @@ class WorkerApiClientTest(unittest.TestCase):
         }
         with worker_server(responses) as origin:
             client = self.client(origin)
-            claim = client.claim(event)
+            resolved = client.resolve(
+                QueuedJobReference.from_dict({"jobId": job_id})
+            )
+            claim = client.claim(resolved)
             heartbeat = client.heartbeat(claim, "heartbeat.test.0001")
             receipt = client.outcome(claim, "WAITING_APPROVAL", "outcome.test.0001")
 
+        self.assertEqual(event.to_dict(), resolved.to_dict())
         self.assertEqual(claim.lease_id, heartbeat["leaseId"])
         self.assertEqual("WAITING_APPROVAL", receipt["status"])
         self.assertTrue(all(item[2] == "Bearer spring-worker-test-token" for item in _Handler.observed))
-        self.assertEqual(claim.lease_id, _Handler.observed[1][1]["leaseId"])
-        self.assertEqual(claim.state_version, _Handler.observed[2][1]["expectedStateVersion"])
+        self.assertEqual(claim.lease_id, _Handler.observed[2][1]["leaseId"])
+        self.assertEqual(claim.state_version, _Handler.observed[3][1]["expectedStateVersion"])
+
+    def test_resolve_rejects_unbound_or_mismatched_job_context(self) -> None:
+        job = QueuedJobReference.from_dict(
+            {"jobId": "20202020-2020-4020-8020-202020202020"}
+        )
+        path = f"/internal/coding/worker/jobs/{job.job_id}/claim-context"
+        unbound = coding_event()
+        for field in (
+            "profileVersionId",
+            "pipelineAttempt",
+            "executionAttempt",
+            "workspaceId",
+            "toolCallId",
+        ):
+            unbound.pop(field)
+        mismatched = coding_event()
+        mismatched["jobId"] = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        for payload in (unbound, mismatched):
+            with self.subTest(fields=set(payload)):
+                with worker_server({path: (200, payload)}) as origin:
+                    with self.assertRaises(WorkerApiError) as raised:
+                        self.client(origin).resolve(job)
+                self.assertEqual("WORKER_RESPONSE_INVALID", raised.exception.code)
 
     def test_claim_rejects_scope_mismatch(self) -> None:
         event = CodingJobRequested.from_dict(coding_event())
