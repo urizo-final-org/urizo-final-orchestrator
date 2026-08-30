@@ -257,20 +257,37 @@ class SnapshotGraphRunner:
                 )
                 return _invoke_graph(graph, None, config)
 
-            if not claim.resume:
-                raise _state_conflict(
-                    "The Snapshot checkpoint requires a resume claim."
-                )
             if event.expected_state_version <= maximum:
                 raise _state_conflict("The Snapshot retry event is stale.")
-            if phase == "COMPLETED":
-                raise _state_conflict("The Snapshot graph is already complete.")
+            checkpoint_attempt = _checkpoint_execution_attempt(values)
+            if execution.execution_attempt < checkpoint_attempt:
+                raise _state_conflict("The Snapshot retry attempt is stale.")
+            if execution.execution_attempt == checkpoint_attempt and (
+                phase != "WAITING_APPROVAL" or not claim.resume
+            ):
+                raise _state_conflict(
+                    "Only a waiting Snapshot approval can resume the same attempt."
+                )
             updated_ledger = {
                 "eventIds": [*event_ids, event.event_id][-100:],
                 "maxStateVersion": event.expected_state_version,
             }
             updates = _execution_updates(event, claim, execution, updated_ledger)
+            if phase == "COMPLETED":
+                return _recover_completed_checkpoint(
+                    graph,
+                    config,
+                    updates,
+                    event,
+                    claim,
+                    execution,
+                    digest,
+                    updated_ledger,
+                )
             if phase == "WAITING_APPROVAL":
+                if execution.execution_attempt > checkpoint_attempt:
+                    graph.update_state(config, updates)
+                    return _invoke_graph(graph, None, config)
                 return _invoke_graph(
                     graph,
                     Command(resume=True, update=updates),
@@ -411,6 +428,15 @@ def _checkpoint_ledger(values: Mapping[str, Any]) -> dict[str, Any]:
     return {"eventIds": list(event_ids), "maxStateVersion": maximum}
 
 
+def _checkpoint_execution_attempt(values: Mapping[str, Any]) -> int:
+    attempt = values.get("executionAttempt")
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+        raise _state_conflict(
+            "The Snapshot checkpoint execution attempt is invalid."
+        )
+    return attempt
+
+
 def _checkpoint_phase(checkpoint: Any) -> str:
     tasks = getattr(checkpoint, "tasks", ())
     if any(getattr(task, "interrupts", ()) for task in tasks):
@@ -435,6 +461,36 @@ def _invoke_graph(
     if phase not in {"WAITING_APPROVAL", "COMPLETED"}:
         raise _state_conflict("Snapshot graph stopped before a terminal boundary.")
     return {**dict(result), "status": phase}
+
+
+def _recover_completed_checkpoint(
+    graph: Any,
+    config: Mapping[str, Any],
+    updates: Mapping[str, Any],
+    event: CodingJobRequested,
+    claim: WorkerClaim,
+    execution: SnapshotExecution,
+    digest: str,
+    expected_ledger: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    graph.update_state(config, dict(updates))
+    checkpoint = graph.get_state(config)
+    values = getattr(checkpoint, "values", None)
+    if (
+        not isinstance(values, Mapping)
+        or not values
+        or _checkpoint_phase(checkpoint) != "COMPLETED"
+    ):
+        raise _state_conflict(
+            "The completed Snapshot checkpoint could not be recovered."
+        )
+    _validate_checkpoint_identity(values, event, execution, digest)
+    if _checkpoint_ledger(values) != dict(expected_ledger):
+        raise _state_conflict(
+            "The completed Snapshot recovery ledger changed."
+        )
+    _validate_recovered_delivery(values, event, claim, execution)
+    return {**dict(values), "status": "COMPLETED"}
 
 
 def _recursion_limit(snapshot: VersionedSnapshot) -> int:

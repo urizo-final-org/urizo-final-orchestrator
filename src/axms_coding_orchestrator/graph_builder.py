@@ -17,6 +17,9 @@ from .node_runtime import (
 from .snapshot import SnapshotNode, VersionedSnapshot
 
 
+_COMMON_FAILURE_HANDLERS = frozenset({"common.guardrail", "common.check"})
+
+
 class SnapshotGraphBuildError(ValueError):
     """A Snapshot cannot be bound to the source registry."""
 
@@ -98,6 +101,7 @@ class SnapshotGraphBuilder:
 
         start = next(node for node in snapshot.nodes if node.node_type == "start")
         end = next(node for node in snapshot.nodes if node.node_type == "end")
+        _validate_common_failure_routes(snapshot, routes, end.node_id)
         graph.add_edge(START, start.node_id)
         for node in snapshot.nodes:
             if node.node_id == end.node_id:
@@ -234,3 +238,18 @@ def _loop_counts(value: Any, limits: Mapping[str, int]) -> dict[str, int]:
 
 def _route_key(source: str, port: str, target: str) -> str:
     return f"{source}:{port}:{target}"
+
+
+def _validate_common_failure_routes(
+    snapshot: VersionedSnapshot,
+    routes: Mapping[tuple[str, str], str],
+    end_node_id: str,
+) -> None:
+    for node in snapshot.nodes:
+        if (
+            node.handler_key in _COMMON_FAILURE_HANDLERS
+            and routes.get((node.node_id, "failed")) != end_node_id
+        ):
+            raise SnapshotGraphBuildError(
+                f"node '{node.node_id}' failed port must route directly to end"
+            )

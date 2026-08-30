@@ -8,13 +8,17 @@ from unittest.mock import Mock
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import interrupt
 
+from axms_coding_orchestrator.common_handlers import build_common_node_registry
 from axms_coding_orchestrator.contracts import (
     CodingJobRequested,
     QueuedJobReference,
     WorkerClaim,
 )
 from axms_coding_orchestrator.graph import CodingGraphRunner, GraphExecutionError
-from axms_coding_orchestrator.graph_builder import SnapshotGraphBuilder
+from axms_coding_orchestrator.graph_builder import (
+    SnapshotGraphBuildError,
+    SnapshotGraphBuilder,
+)
 from axms_coding_orchestrator.node_runtime import (
     NodeInvocation,
     NodeRegistry,
@@ -148,6 +152,42 @@ def _interrupt_snapshot(
             _edge("fixture_pause", "fixture_resumed", "fixture_end"),
         ],
         profile_version_id=profile_version_id,
+    )
+
+
+def _common_approval_snapshot() -> VersionedSnapshot:
+    return _snapshot(
+        [
+            _node("start", "start", "common.start", ["next"]),
+            _node(
+                "guardrail",
+                "guardrail",
+                "common.guardrail",
+                ["passed", "failed"],
+                {"locked": True},
+            ),
+            _node(
+                "check",
+                "check",
+                "common.check",
+                ["passed", "failed"],
+            ),
+            _node(
+                "approval",
+                "approval",
+                "common.approval",
+                ["approved"],
+            ),
+            _node("end", "end", "common.end", []),
+        ],
+        [
+            _edge("start", "next", "guardrail"),
+            _edge("guardrail", "passed", "check"),
+            _edge("guardrail", "failed", "end"),
+            _edge("check", "passed", "approval"),
+            _edge("check", "failed", "end"),
+            _edge("approval", "approved", "end"),
+        ],
     )
 
 
@@ -364,6 +404,352 @@ class _Heartbeat:
 
 
 class SnapshotRunnerCompatibilityTest(unittest.TestCase):
+    def test_common_failure_ports_must_route_directly_to_end(self) -> None:
+        original = _common_approval_snapshot()
+
+        for source in ("guardrail", "check"):
+            payload = original.to_dict()
+            edge = next(
+                item
+                for item in payload["edges"]
+                if item["from"] == source and item["resultPort"] == "failed"
+            )
+            edge["to"] = "approval"
+            snapshot = VersionedSnapshot.from_dict(payload)
+
+            with self.subTest(source=source), self.assertRaisesRegex(
+                SnapshotGraphBuildError,
+                "failed port must route directly to end",
+            ):
+                SnapshotGraphBuilder(build_common_node_registry()).compile(
+                    snapshot
+                )
+
+    def test_common_invalid_or_missing_digest_terminates_without_approval_interrupt(
+        self,
+    ) -> None:
+        snapshot = _common_approval_snapshot()
+        event = _event()
+
+        for field, value in (
+            ("policyHash", "not-a-digest"),
+            ("contextDigest", None),
+        ):
+            context = event.job_payload
+            if value is None:
+                context.pop(field)
+            else:
+                context[field] = value
+            runner = SnapshotGraphRunner(
+                _Provider(_execution(snapshot, context=context)),
+                build_common_node_registry(),
+                InMemorySaver(),
+            )
+
+            with self.subTest(field=field):
+                completed = runner.invoke(event, _claim(event))
+                self.assertEqual("COMPLETED", completed["status"])
+                self.assertNotIn("__interrupt__", completed)
+
+    def test_common_approval_resumes_the_same_checkpoint_as_approved(self) -> None:
+        snapshot = _common_approval_snapshot()
+        event = _event()
+        provider = _Provider(_execution(snapshot, context=event.job_payload))
+        checkpointer = InMemorySaver()
+        runner = SnapshotGraphRunner(
+            provider,
+            build_common_node_registry(),
+            checkpointer,
+        )
+        waiting = runner.invoke(event, _claim(event))
+
+        self.assertEqual("WAITING_APPROVAL", waiting["status"])
+        self.assertIn("__interrupt__", waiting)
+        self.assertEqual({event.job_id}, set(checkpointer.storage))
+
+        resume_event = _event(
+            event_id="41414141-4141-4141-8141-414141414141",
+            version=6,
+        )
+        restarted = SnapshotGraphRunner(
+            provider,
+            build_common_node_registry(),
+            checkpointer,
+        )
+        completed = restarted.invoke(
+            resume_event,
+            _claim(resume_event, resume=True, state_version=7),
+        )
+
+        self.assertEqual("COMPLETED", completed["status"])
+        self.assertEqual(event.job_id, completed["jobId"])
+        self.assertEqual(PROFILE_VERSION_ID, completed["profileVersionId"])
+        self.assertTrue(restarted.is_duplicate(resume_event))
+
+    def test_waiting_technical_retry_cannot_approve_before_same_attempt_resume(
+        self,
+    ) -> None:
+        snapshot = _common_approval_snapshot()
+        initial_event = _event()
+        retry_event = _event(
+            event_id="42424242-4242-4242-8242-424242424242",
+            version=6,
+            attempt=2,
+        )
+        same_attempt_without_approval = _event(
+            event_id="43434343-4343-4343-8343-434343434343",
+            version=8,
+            attempt=2,
+        )
+        legacy_retry_event = _event(
+            event_id="47474747-4747-4747-8747-474747474747",
+            version=8,
+            attempt=3,
+        )
+        approval_event = _event(
+            event_id="48484848-4848-4848-8848-484848484848",
+            version=10,
+            attempt=3,
+        )
+        initial_execution = _execution(
+            snapshot,
+            context=initial_event.job_payload,
+        )
+        retry_execution = _execution(
+            snapshot,
+            execution_attempt=2,
+            context=initial_event.job_payload,
+        )
+        third_execution = _execution(
+            snapshot,
+            execution_attempt=3,
+            context=initial_event.job_payload,
+        )
+        provider = _Provider(
+            initial_execution,
+            {
+                retry_event.event_id: retry_execution,
+                same_attempt_without_approval.event_id: retry_execution,
+                legacy_retry_event.event_id: third_execution,
+                approval_event.event_id: third_execution,
+            },
+        )
+        checkpointer = InMemorySaver()
+        registry = build_common_node_registry()
+        runner = SnapshotGraphRunner(provider, registry, checkpointer)
+
+        waiting = runner.invoke(initial_event, _claim(initial_event))
+        self.assertEqual("WAITING_APPROVAL", waiting["status"])
+
+        technical_retry = SnapshotGraphRunner(
+            provider, registry, checkpointer
+        ).invoke(
+            retry_event,
+            _claim(retry_event, resume=False, state_version=7),
+        )
+
+        self.assertEqual("WAITING_APPROVAL", technical_retry["status"])
+        self.assertEqual(2, technical_retry["executionAttempt"])
+        self.assertEqual(
+            6,
+            technical_retry["_snapshotLedger"]["maxStateVersion"],
+        )
+        self.assertEqual({initial_event.job_id}, set(checkpointer.storage))
+
+        with self.assertRaisesRegex(
+            GraphExecutionError, "waiting Snapshot approval"
+        ) as failure:
+            runner.invoke(
+                same_attempt_without_approval,
+                _claim(
+                    same_attempt_without_approval,
+                    resume=False,
+                    state_version=9,
+                ),
+            )
+        self.assertEqual("JOB_STATE_VERSION_CONFLICT", failure.exception.code)
+
+        legacy_retry = SnapshotGraphRunner(
+            provider, registry, checkpointer
+        ).invoke(
+            legacy_retry_event,
+            _claim(legacy_retry_event, resume=True, state_version=9),
+        )
+        self.assertEqual("WAITING_APPROVAL", legacy_retry["status"])
+        self.assertEqual(3, legacy_retry["executionAttempt"])
+
+        completed = SnapshotGraphRunner(provider, registry, checkpointer).invoke(
+            approval_event,
+            _claim(approval_event, resume=True, state_version=11),
+        )
+
+        self.assertEqual("COMPLETED", completed["status"])
+        self.assertEqual(initial_event.job_id, completed["jobId"])
+        self.assertEqual(PROFILE_VERSION_ID, completed["profileVersionId"])
+
+    def test_completed_checkpoint_recovers_only_a_newer_technical_attempt(
+        self,
+    ) -> None:
+        snapshot = _linear_snapshot()
+        log: list[tuple[str, NodeInvocation]] = []
+        handlers = {
+            "fixture.start": _fixed_handler(log, "fixture.start", "fixture_next"),
+            "fixture.guardrail": _fixed_handler(
+                log, "fixture.guardrail", "fixture_passed"
+            ),
+            "fixture.work": _fixed_handler(log, "fixture.work", "fixture_done"),
+            "fixture.end": _fixed_handler(log, "fixture.end", None),
+        }
+        initial_event = _event()
+        recovery_event = _event(
+            event_id="44444444-4444-4444-8444-444444444444",
+            version=6,
+            attempt=2,
+        )
+        same_attempt_event = _event(
+            event_id="45454545-4545-4545-8545-454545454545",
+            version=8,
+            attempt=2,
+        )
+        lower_attempt_event = _event(
+            event_id="46464646-4646-4646-8646-464646464646",
+            version=8,
+        )
+        recovery_execution = _execution(snapshot, execution_attempt=2)
+        provider = _Provider(
+            _execution(snapshot),
+            {
+                recovery_event.event_id: recovery_execution,
+                same_attempt_event.event_id: recovery_execution,
+            },
+        )
+        registry = _registry(snapshot, handlers)
+        checkpointer = InMemorySaver()
+        runner = SnapshotGraphRunner(provider, registry, checkpointer)
+
+        first = runner.invoke(initial_event, _claim(initial_event))
+        completed_log = list(log)
+        self.assertEqual("COMPLETED", first["status"])
+
+        recovered = SnapshotGraphRunner(provider, registry, checkpointer).invoke(
+            recovery_event,
+            _claim(recovery_event, resume=False, state_version=7),
+        )
+
+        self.assertEqual("COMPLETED", recovered["status"])
+        self.assertEqual(initial_event.job_id, recovered["jobId"])
+        self.assertEqual(PROFILE_VERSION_ID, recovered["profileVersionId"])
+        self.assertEqual(2, recovered["executionAttempt"])
+        self.assertEqual(6, recovered["_snapshotLedger"]["maxStateVersion"])
+        self.assertEqual(completed_log, log)
+        self.assertTrue(runner.is_duplicate(recovery_event))
+
+        replayed = runner.invoke(
+            recovery_event,
+            _claim(recovery_event, resume=False, state_version=7),
+        )
+        self.assertEqual("COMPLETED", replayed["status"])
+        self.assertEqual(completed_log, log)
+
+        for event, execution in (
+            (same_attempt_event, recovery_execution),
+            (lower_attempt_event, _execution(snapshot)),
+        ):
+            provider.executions[event.event_id] = execution
+            with self.subTest(execution_attempt=execution.execution_attempt):
+                with self.assertRaises(GraphExecutionError) as failure:
+                    runner.invoke(
+                        event,
+                        _claim(event, resume=True, state_version=9),
+                    )
+                self.assertEqual(
+                    "JOB_STATE_VERSION_CONFLICT", failure.exception.code
+                )
+                self.assertEqual(completed_log, log)
+
+    def test_fresh_higher_attempt_starts_only_without_resume(self) -> None:
+        snapshot = _linear_snapshot()
+        event = _event(attempt=2)
+        execution = _execution(snapshot, execution_attempt=2)
+        log: list[tuple[str, NodeInvocation]] = []
+        handlers = {
+            "fixture.start": _fixed_handler(log, "fixture.start", "fixture_next"),
+            "fixture.guardrail": _fixed_handler(
+                log, "fixture.guardrail", "fixture_passed"
+            ),
+            "fixture.work": _fixed_handler(log, "fixture.work", "fixture_done"),
+            "fixture.end": _fixed_handler(log, "fixture.end", None),
+        }
+        registry = _registry(snapshot, handlers)
+
+        completed = SnapshotGraphRunner(
+            _Provider(execution), registry, InMemorySaver()
+        ).invoke(event, _claim(event, resume=False))
+        self.assertEqual("COMPLETED", completed["status"])
+        self.assertEqual(2, completed["executionAttempt"])
+
+        with self.assertRaisesRegex(
+            GraphExecutionError, "resume claim has no checkpoint"
+        ) as failure:
+            SnapshotGraphRunner(
+                _Provider(execution), registry, InMemorySaver()
+            ).invoke(event, _claim(event, resume=True))
+        self.assertEqual("JOB_STATE_VERSION_CONFLICT", failure.exception.code)
+
+    def test_running_checkpoint_rejects_a_new_same_attempt_delivery(self) -> None:
+        snapshot = _retry_snapshot()
+        log: list[tuple[str, NodeInvocation]] = []
+
+        def failing(invocation: NodeInvocation) -> NodeResult:
+            log.append(("fixture.flaky", invocation))
+            raise RuntimeError("fixture transient failure")
+
+        handlers = {
+            "fixture.start": _fixed_handler(log, "fixture.start", "fixture_next"),
+            "fixture.guardrail": _fixed_handler(
+                log, "fixture.guardrail", "fixture_passed"
+            ),
+            "fixture.stable": _fixed_handler(
+                log, "fixture.stable", "fixture_next"
+            ),
+            "fixture.flaky": failing,
+            "fixture.end": _fixed_handler(log, "fixture.end", None),
+        }
+        initial_event = _event()
+        different_event = _event(
+            event_id="49494949-4949-4949-8949-494949494949",
+            version=6,
+        )
+        provider = _Provider(_execution(snapshot))
+        registry = _registry(snapshot, handlers)
+        checkpointer = InMemorySaver()
+        runner = SnapshotGraphRunner(provider, registry, checkpointer)
+
+        with self.assertRaisesRegex(RuntimeError, "fixture transient"):
+            runner.invoke(initial_event, _claim(initial_event))
+
+        graph = SnapshotGraphBuilder(registry).compile(
+            snapshot, checkpointer=checkpointer
+        )
+        config = {"configurable": {"thread_id": initial_event.job_id}}
+        before = graph.get_state(config)
+        before_values = dict(before.values)
+        before_log = list(log)
+
+        with self.assertRaisesRegex(
+            GraphExecutionError, "same attempt"
+        ) as failure:
+            runner.invoke(
+                different_event,
+                _claim(different_event, resume=True, state_version=7),
+            )
+
+        after = graph.get_state(config)
+        self.assertEqual("JOB_STATE_VERSION_CONFLICT", failure.exception.code)
+        self.assertEqual(before_values, dict(after.values))
+        self.assertEqual(before.next, after.next)
+        self.assertEqual(before_log, log)
+
     def test_terminal_delivery_replays_outcome_without_rerunning_handlers(
         self,
     ) -> None:
