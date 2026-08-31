@@ -36,6 +36,10 @@ CODING_HANDLER_CONTRACTS: Mapping[str, tuple[frozenset[str], frozenset[str]]] = 
     ),
     "coding.pr_request": (frozenset({"tool"}), frozenset({"requested"})),
     "coding.deploy_request": (frozenset({"tool"}), frozenset({"recorded"})),
+    "coding.rework_gate": (
+        frozenset({"check"}),
+        frozenset({"retry", "handover"}),
+    ),
 }
 
 _STAGE_RESULT_TYPES = {
@@ -225,7 +229,41 @@ def register_coding_node_handlers(
         result_ports=["approved", "rejected"],
         handler=_approval_handler(dependencies, candidate=True),
     )
+    node_types, ports = CODING_HANDLER_CONTRACTS["coding.rework_gate"]
+    registry.register(
+        "coding.rework_gate",
+        node_types=node_types,
+        result_ports=ports,
+        handler=_rework_gate_handler(),
+    )
     return registry
+
+
+def _rework_gate_handler() -> Any:
+    """Decide whether a rejected review returns to coding or hands over to a human.
+
+    The bounded loop in the common graph builder raises once the retry edge is
+    exhausted, which would end the Job as an execution error and leave the
+    handover screen with nothing to read. This gate keeps the same round budget
+    but turns the final rejection into a declared port, so the Job finishes
+    normally with the generated candidates and review reasons already recorded.
+    """
+
+    def handle(invocation: NodeInvocation) -> NodeResult:
+        config = invocation.config
+        if set(config) != {"maxReworkRounds"}:
+            raise _contract_failure("coding.rework_gate config is invalid")
+        maximum = config["maxReworkRounds"]
+        if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 1:
+            raise _contract_failure("coding.rework_gate maxReworkRounds is invalid")
+        try:
+            round_number, rounds = _next_round(invocation)
+        except (TypeError, ValueError):
+            raise _contract_failure("The Coding stage returned an invalid result.") from None
+        port = "retry" if round_number < maximum else "handover"
+        return NodeResult.create(port, {"codingStageRounds": rounds})
+
+    return handle
 
 
 def _stage_handler(

@@ -8,8 +8,13 @@ from typing import Any
 from .snapshot import VersionedSnapshot
 
 
-DEFAULT_CODING_PROFILE_VERSION_ID = "d3d41f73-9a07-51e5-9ec8-4ed8aca7f7cb"
-DEFAULT_CODING_PROFILE_VERSION = 2
+# A new graph is a new Profile Version. The Backend seed keys on
+# profile_version_id with ON CONFLICT DO NOTHING and then requires the stored
+# snapshot_json to equal the seeded text, so reusing an id with changed
+# content breaks every environment that already seeded the old one.
+# uuid5(NAMESPACE_URL, "axms:LLM_OPS:profile-version:3:review-handover")
+DEFAULT_CODING_PROFILE_VERSION_ID = "79b331f0-2824-5d2a-af4c-98f58f401dec"
+DEFAULT_CODING_PROFILE_VERSION = 3
 CODING_TOOL_NAMES = (
     "read_file",
     "search_code",
@@ -68,6 +73,13 @@ _DEFAULT_CODING_SNAPSHOT: dict[str, Any] = {
             "handlerKey": "coding.review",
             "resultPorts": ["passed", "changes_requested"],
             "config": {},
+        },
+        {
+            "id": "rework_gate",
+            "type": "check",
+            "handlerKey": "coding.rework_gate",
+            "resultPorts": ["retry", "handover"],
+            "config": {"maxReworkRounds": 3},
         },
         {
             "id": "preview",
@@ -138,8 +150,10 @@ _DEFAULT_CODING_SNAPSHOT: dict[str, Any] = {
         {
             "from": "review",
             "resultPort": "changes_requested",
-            "to": "code",
+            "to": "rework_gate",
         },
+        {"from": "rework_gate", "resultPort": "retry", "to": "code"},
+        {"from": "rework_gate", "resultPort": "handover", "to": "end"},
         {"from": "preview", "resultPort": "ready", "to": "preview_approval"},
         {
             "from": "preview_approval",
@@ -162,12 +176,12 @@ _DEFAULT_CODING_SNAPSHOT: dict[str, Any] = {
         {"from": "deploy_request", "resultPort": "recorded", "to": "end"},
     ],
     "config": {
-        "maxNodes": 14,
+        "maxNodes": 15,
         "maxAttempts": 3,
         "loopLimits": [
             {
-                "from": "review",
-                "resultPort": "changes_requested",
+                "from": "rework_gate",
+                "resultPort": "retry",
                 "to": "code",
                 "maxIterations": 2,
             },

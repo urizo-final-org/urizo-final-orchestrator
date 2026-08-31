@@ -56,7 +56,7 @@ class DefaultCodingSnapshotTest(unittest.TestCase):
         self.assertEqual({"analyze", "code", "review"}, set(snapshot.model_bindings))
         self.assertEqual(list(CODING_TOOL_NAMES), snapshot.tool_policy["allowedTools"])
         limits = {limit.route(): limit.max_iterations for limit in snapshot.config.loop_limits}
-        self.assertEqual(2, limits[("review", "changes_requested", "code")])
+        self.assertEqual(2, limits[("rework_gate", "retry", "code")])
         self.assertEqual(2, limits[("preview_approval", "rejected", "analyze")])
 
     def test_fixture_compiles_against_common_plus_coding_registry(self) -> None:

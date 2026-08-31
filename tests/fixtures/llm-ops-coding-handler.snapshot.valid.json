@@ -1,8 +1,8 @@
 {
   "contractVersion": "1.0",
-  "profileVersionId": "d3d41f73-9a07-51e5-9ec8-4ed8aca7f7cb",
+  "profileVersionId": "79b331f0-2824-5d2a-af4c-98f58f401dec",
   "profileKey": "LLM_OPS",
-  "profileVersion": 2,
+  "profileVersion": 3,
   "nodes": [
     {"id":"start","type":"start","handlerKey":"common.start","resultPorts":["next"],"config":{}},
     {"id":"guardrail","type":"guardrail","handlerKey":"common.guardrail","resultPorts":["passed","failed"],"config":{"locked":true}},
@@ -10,6 +10,7 @@
     {"id":"scope_approval","type":"approval","handlerKey":"coding.approval","resultPorts":["approved"],"config":{"stage":"SCOPE","requiredRole":"GENERAL_ADMIN"}},
     {"id":"code","type":"agent","handlerKey":"coding.code","resultPorts":["completed"],"config":{}},
     {"id":"review","type":"agent","handlerKey":"coding.review","resultPorts":["passed","changes_requested"],"config":{}},
+    {"id":"rework_gate","type":"check","handlerKey":"coding.rework_gate","resultPorts":["retry","handover"],"config":{"maxReworkRounds":3}},
     {"id":"preview","type":"tool","handlerKey":"coding.preview","resultPorts":["ready"],"config":{}},
     {"id":"preview_approval","type":"approval","handlerKey":"coding.preview_approval","resultPorts":["approved","rejected"],"config":{"stage":"CANDIDATE","requiredRole":"GENERAL_ADMIN"}},
     {"id":"pr_request","type":"tool","handlerKey":"coding.pr_request","resultPorts":["requested"],"config":{}},
@@ -28,7 +29,9 @@
     {"from":"scope_approval","resultPort":"approved","to":"code"},
     {"from":"code","resultPort":"completed","to":"review"},
     {"from":"review","resultPort":"passed","to":"preview"},
-    {"from":"review","resultPort":"changes_requested","to":"code"},
+    {"from":"review","resultPort":"changes_requested","to":"rework_gate"},
+    {"from":"rework_gate","resultPort":"retry","to":"code"},
+    {"from":"rework_gate","resultPort":"handover","to":"end"},
     {"from":"preview","resultPort":"ready","to":"preview_approval"},
     {"from":"preview_approval","resultPort":"approved","to":"pr_request"},
     {"from":"preview_approval","resultPort":"rejected","to":"analyze"},
@@ -39,10 +42,10 @@
     {"from":"deploy_request","resultPort":"recorded","to":"end"}
   ],
   "config": {
-    "maxNodes": 14,
+    "maxNodes": 15,
     "maxAttempts": 3,
     "loopLimits": [
-      {"from":"review","resultPort":"changes_requested","to":"code","maxIterations":2},
+      {"from":"rework_gate","resultPort":"retry","to":"code","maxIterations":2},
       {"from":"preview_approval","resultPort":"rejected","to":"analyze","maxIterations":2}
     ]
   },

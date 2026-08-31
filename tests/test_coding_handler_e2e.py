@@ -356,7 +356,7 @@ class CodingHandlerGraphContractTest(unittest.TestCase):
         self.assertEqual("analyze", waiting["_snapshotLastNodeId"])
         self.assertEqual(2, waiting["pipelineAttempt"])
 
-    def test_third_review_rework_edge_is_rejected_by_common_loop_bound(self) -> None:
+    def test_third_review_rework_hands_over_instead_of_failing(self) -> None:
         graph, domain, executor, config = self._runtime(
             review_ports=["changes_requested"]
         )
@@ -369,15 +369,19 @@ class CodingHandlerGraphContractTest(unittest.TestCase):
             state_version=6,
         )
 
-        with self.assertRaisesRegex(
-            SnapshotGraphExecutionError, "exceeded its bounded loop"
-        ):
-            graph.invoke(  # type: ignore[attr-defined]
-                Command(resume=True, update={"stateVersion": 6}), config=config
-            )
+        final = graph.invoke(  # type: ignore[attr-defined]
+            Command(resume=True, update={"stateVersion": 6}), config=config
+        )
 
+        # The Job must finish, not raise: the handover screen reads the recorded
+        # candidates and review reasons, and an execution error records neither.
+        self.assertNotIn("__interrupt__", final)
+        self.assertEqual("end", final["_snapshotLastNodeId"])
         self.assertEqual(3, executor.counts["coding.code"])
         self.assertEqual(3, executor.counts["coding.review"])
+        self.assertEqual(3, final["context"]["codingStageRounds"]["rework_gate"] - 1)
+        self.assertEqual({"rework_gate:retry:code": 2}, final["_snapshotLoopCounts"])
+        self.assertNotIn("coding.preview", executor.counts)
 
 
 if __name__ == "__main__":
