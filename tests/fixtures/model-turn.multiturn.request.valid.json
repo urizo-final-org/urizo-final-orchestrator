@@ -1,0 +1,57 @@
+{
+  "schemaVersion": "1.0",
+  "turnId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaac",
+  "jobId": "55555555-5555-4555-8555-555555555555",
+  "traceId": "66666666-6666-4666-8666-666666666666",
+  "idempotencyKey": "stage0.model.multiturn.0001",
+  "attempt": 2,
+  "expectedStateVersion": 6,
+  "nodeName": "plan",
+  "promptVersion": "coding-plan-v1",
+  "contextDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "requiredCapabilities": ["CHAT", "TOOL_CALLING"],
+  "messages": [
+    {
+      "role": "user",
+      "content": "Inspect the contract README."
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "toolCalls": [
+        {
+          "toolCallId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          "name": "read_file",
+          "arguments": { "path": "contracts/README.md" }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "toolCallId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      "executionId": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      "result": {
+        "mediaType": "text/plain",
+        "resultRef": "/internal/coding/tool-executions/dddddddd-dddd-4ddd-8ddd-dddddddddddd/result",
+        "sizeBytes": 34,
+        "digest": "sha256:dedafe29e9fcef22a39e620229205e268bc1d085ce92abdc2e3c0b918a4c161b"
+      },
+      "content": "Stage 0 contract boundary summary."
+    }
+  ],
+  "toolSchemas": [
+    {
+      "name": "read_file",
+      "description": "Read one approved relative file.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path"],
+        "properties": { "path": { "type": "string" } }
+      },
+      "schemaDigest": "sha256:39b714704935190561ed407980480b9a4a0b346b97346e0bff71fb9ace820194"
+    }
+  ],
+  "responseFormat": { "type": "TEXT" },
+  "deadlineAt": "2026-08-10T09:15:00Z"
+}

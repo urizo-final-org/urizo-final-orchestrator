@@ -250,7 +250,12 @@ class ModelTurnRequest:
         return deepcopy(self._payload)
 
     def to_json(self) -> bytes:
-        return json.dumps(self._payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        return json.dumps(
+            self._payload,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
 
     @property
     def deadline_at(self) -> datetime:
