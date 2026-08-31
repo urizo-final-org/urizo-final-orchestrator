@@ -36,6 +36,12 @@ from .model_gateway import (
     ModelGatewayClient,
     ModelGatewayRemoteError,
 )
+from .natural_cms_domain_client import SpringNaturalCmsDomainClient
+from .natural_cms_handlers import (
+    NaturalCmsHandlerDependencies,
+    SpringGatewayNaturalCmsStageExecutor,
+    register_natural_cms_node_handlers,
+)
 from .profile_version_client import ProfileVersionClient
 from .queue import QueueError, ValkeyJobQueue
 from .snapshot_runner import (
@@ -446,6 +452,19 @@ def main() -> None:
             CodingHandlerDependencies(
                 domain_client=coding_domain_client,
                 executor=SpringGatewayCodingStageExecutor(coding_domain_client),
+            ),
+        )
+        natural_cms_domain_client = SpringNaturalCmsDomainClient(
+            settings.spring_origin,
+            credential_resolver,
+        )
+        register_natural_cms_node_handlers(
+            production_registry,
+            NaturalCmsHandlerDependencies(
+                domain_client=natural_cms_domain_client,
+                executor=SpringGatewayNaturalCmsStageExecutor(
+                    natural_cms_domain_client
+                ),
             ),
         )
         snapshot_graph = SnapshotGraphRunner(
