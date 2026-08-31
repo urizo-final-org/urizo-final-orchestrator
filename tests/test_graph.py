@@ -87,6 +87,22 @@ class CodingGraphTest(unittest.TestCase):
             build_coding_graph(self.checkpointer, self.dependencies)
         )
 
+    def test_legacy_single_graph_still_denies_a_snapshot_without_the_plan_node(self) -> None:
+        """The 'plan' requirement belongs to this legacy graph alone. It is enforced
+        here, not in the shared claim contract that both execution paths use."""
+
+        event = CodingJobRequested.from_dict(coding_event())
+        payload = worker_claim(event.to_dict())
+        payload["snapshot"]["allowedNodes"] = ["analyze"]
+        claim = WorkerClaim.from_dict(payload, event, now=FIXED_NOW)
+
+        with self.assertRaises(GraphExecutionError) as denied:
+            self.runner.invoke(event, claim)
+
+        self.assertEqual("SERVICE_AUTHORIZATION_DENIED", denied.exception.code)
+        self.assertFalse(denied.exception.retryable)
+        self.assertEqual([], self.model.requests)
+
     def test_single_graph_interrupts_and_resumes_same_job_without_repeating_tools(self) -> None:
         event = CodingJobRequested.from_dict(coding_event())
         claim = WorkerClaim.from_dict(

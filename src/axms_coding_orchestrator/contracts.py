@@ -252,8 +252,6 @@ class ClaimSnapshot:
         nodes = _string_list(payload["allowedNodes"], "snapshot.allowedNodes", 1, 50, 120)
         if any(not GRAPH_STEP.fullmatch(node) for node in nodes):
             raise WorkerContractViolation("snapshot.allowedNodes is invalid")
-        if "plan" not in nodes:
-            raise WorkerContractViolation("snapshot does not allow the plan node")
         _timestamp(payload["deadlineAt"], "snapshot.deadlineAt")
         _bounded_string(payload["systemPrompt"], "snapshot.systemPrompt", 1, 200_000)
         _bounded_string(payload["userPrompt"], "snapshot.userPrompt", 1, 200_000)
