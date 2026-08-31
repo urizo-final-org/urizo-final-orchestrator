@@ -326,6 +326,7 @@ class SpringCodingDomainClientTest(unittest.TestCase):
                 "traceId": TRACE_ID,
                 "expectedStateVersion": 7,
                 "executionAttempt": 3,
+                "nodeId": "preview",
                 "handlerKey": "coding.preview",
                 "resultId": RESULT_ID,
             },

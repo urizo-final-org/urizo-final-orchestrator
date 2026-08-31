@@ -580,6 +580,7 @@ class SpringCodingDomainClient:
             "traceId": invocation.trace_id,
             "expectedStateVersion": invocation.state_version,
             "executionAttempt": invocation.execution_attempt,
+            "nodeId": invocation.node_id,
             "handlerKey": handler_key,
             "resultId": result_id,
         }
