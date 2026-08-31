@@ -250,12 +250,25 @@ class SnapshotGraphRunner:
             if same_delivery:
                 _validate_recovered_delivery(values, event, claim, execution)
                 if phase in {"WAITING_APPROVAL", "COMPLETED"}:
-                    return {**dict(values), "status": phase}
+                    return _boundary_result(
+                        values,
+                        checkpoint,
+                        event,
+                        claim,
+                        execution,
+                    )
                 graph.update_state(
                     config,
                     _execution_updates(event, claim, execution, ledger),
                 )
-                return _invoke_graph(graph, None, config)
+                return _invoke_graph(
+                    graph,
+                    None,
+                    config,
+                    event,
+                    claim,
+                    execution,
+                )
 
             if event.expected_state_version <= maximum:
                 raise _state_conflict("The Snapshot retry event is stale.")
@@ -287,14 +300,31 @@ class SnapshotGraphRunner:
             if phase == "WAITING_APPROVAL":
                 if execution.execution_attempt > checkpoint_attempt:
                     graph.update_state(config, updates)
-                    return _invoke_graph(graph, None, config)
+                    return _invoke_graph(
+                        graph,
+                        None,
+                        config,
+                        event,
+                        claim,
+                        execution,
+                    )
                 return _invoke_graph(
                     graph,
                     Command(resume=True, update=updates),
                     config,
+                    event,
+                    claim,
+                    execution,
                 )
             graph.update_state(config, updates)
-            return _invoke_graph(graph, None, config)
+            return _invoke_graph(
+                graph,
+                None,
+                config,
+                event,
+                claim,
+                execution,
+            )
 
         if claim.resume:
             raise _state_conflict("The Snapshot resume claim has no checkpoint.")
@@ -311,7 +341,14 @@ class SnapshotGraphRunner:
             "context": execution.context,
             "_snapshotProfileDigest": digest,
         }
-        return _invoke_graph(graph, initial, config)
+        return _invoke_graph(
+            graph,
+            initial,
+            config,
+            event,
+            claim,
+            execution,
+        )
 
     def _runtime(
         self, event: CodingJobRequested
@@ -448,7 +485,12 @@ def _checkpoint_phase(checkpoint: Any) -> str:
 
 
 def _invoke_graph(
-    graph: Any, value: Any, config: Mapping[str, Any]
+    graph: Any,
+    value: Any,
+    config: Mapping[str, Any],
+    event: CodingJobRequested,
+    claim: WorkerClaim,
+    execution: SnapshotExecution,
 ) -> Mapping[str, Any]:
     try:
         result = graph.invoke(value, config=config)
@@ -460,7 +502,129 @@ def _invoke_graph(
     phase = _checkpoint_phase(checkpoint)
     if phase not in {"WAITING_APPROVAL", "COMPLETED"}:
         raise _state_conflict("Snapshot graph stopped before a terminal boundary.")
-    return {**dict(result), "status": phase}
+    return _boundary_result(result, checkpoint, event, claim, execution)
+
+
+def _boundary_result(
+    result: Mapping[str, Any],
+    checkpoint: Any,
+    event: CodingJobRequested,
+    claim: WorkerClaim,
+    execution: SnapshotExecution,
+) -> Mapping[str, Any]:
+    phase = _checkpoint_phase(checkpoint)
+    boundary = {**dict(result), "status": phase}
+    if phase == "WAITING_APPROVAL":
+        boundary["pendingApproval"] = _pending_approval(
+            checkpoint,
+            event,
+            claim,
+            execution,
+        )
+    return boundary
+
+
+def _pending_approval(
+    checkpoint: Any,
+    event: CodingJobRequested,
+    claim: WorkerClaim,
+    execution: SnapshotExecution,
+) -> dict[str, Any]:
+    interrupted = [
+        (task, item)
+        for task in getattr(checkpoint, "tasks", ())
+        for item in getattr(task, "interrupts", ())
+    ]
+    if len(interrupted) != 1:
+        raise _contract_failure(
+            "A waiting Snapshot must have exactly one approval interrupt."
+        )
+    task, item = interrupted[0]
+    value = getattr(item, "value", None)
+    if not isinstance(value, Mapping) or not all(
+        isinstance(key, str) for key in value
+    ):
+        raise _contract_failure(
+            "The waiting Snapshot approval interrupt is invalid."
+        )
+    payload = deepcopy(dict(value))
+    common_fields = {
+        "schemaVersion",
+        "jobId",
+        "profileVersionId",
+        "nodeId",
+        "traceId",
+        "stateVersion",
+    }
+    coding_fields = {
+        "approvalId",
+        "stage",
+        "stageRound",
+        "requiredRole",
+        "pipelineAttempt",
+    }
+    fields = set(payload)
+    coding_authority = bool(fields & coding_fields)
+    if fields != common_fields | (coding_fields if coding_authority else set()):
+        raise _contract_failure(
+            "The waiting Snapshot approval interrupt is invalid."
+        )
+    positive_fields = ("stateVersion",)
+    if coding_authority:
+        positive_fields += ("pipelineAttempt", "stageRound")
+    for field in positive_fields:
+        if (
+            isinstance(payload[field], bool)
+            or not isinstance(payload[field], int)
+            or payload[field] < 1
+        ):
+            raise _contract_failure(
+                "The waiting Snapshot approval interrupt is invalid."
+            )
+    node_id = getattr(task, "name", None)
+    correlations = {
+        "schemaVersion": "1.0",
+        "jobId": event.job_id,
+        "profileVersionId": execution.snapshot.profile_version_id,
+        "nodeId": node_id,
+        "traceId": claim.trace_id,
+        "stateVersion": claim.state_version,
+    }
+    if coding_authority:
+        correlations["pipelineAttempt"] = execution.pipeline_attempt
+    if (
+        not isinstance(node_id, str)
+        or any(
+            payload.get(field) != expected
+            for field, expected in correlations.items()
+        )
+        or claim.job_id != event.job_id
+        or claim.profile_version_id != execution.snapshot.profile_version_id
+        or event.profile_version_id != execution.snapshot.profile_version_id
+        or event.trace_id != claim.trace_id
+    ):
+        raise _state_conflict(
+            "The waiting Snapshot approval interrupt changed execution authority."
+        )
+    if coding_authority:
+        try:
+            if (
+                _optional_uuid(
+                    payload["approvalId"], "pendingApproval.approvalId"
+                )
+                is None
+            ):
+                raise ValueError
+        except ValueError:
+            raise _contract_failure(
+                "The waiting Snapshot approval interrupt is invalid."
+            ) from None
+        for field in ("stage", "requiredRole"):
+            if not isinstance(payload[field], str) or not payload[field]:
+                raise _contract_failure(
+                    "The waiting Snapshot approval interrupt is invalid."
+                )
+    return payload
 
 
 def _recover_completed_checkpoint(

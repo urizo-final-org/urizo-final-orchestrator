@@ -264,6 +264,17 @@ def _fixed_handler(
     return run
 
 
+def _fixture_pending_approval(invocation: NodeInvocation) -> dict[str, Any]:
+    return {
+        "schemaVersion": "1.0",
+        "jobId": invocation.job_id,
+        "profileVersionId": invocation.profile_version_id,
+        "nodeId": invocation.node_id,
+        "traceId": invocation.trace_id,
+        "stateVersion": invocation.state_version,
+    }
+
+
 def _registry(
     snapshot: VersionedSnapshot, handlers: Mapping[str, Handler]
 ) -> NodeRegistry:
@@ -857,9 +868,22 @@ class SnapshotRunnerCompatibilityTest(unittest.TestCase):
     def test_interrupt_resumes_same_checkpoint_after_runner_restart(self) -> None:
         snapshot = _interrupt_snapshot()
         log: list[tuple[str, NodeInvocation]] = []
+        pending_approval = {
+            "schemaVersion": "1.0",
+            "approvalId": "61616161-6161-4161-8161-616161616161",
+            "jobId": JOB_ID,
+            "profileVersionId": PROFILE_VERSION_ID,
+            "nodeId": "fixture_pause",
+            "stage": "SCOPE",
+            "stageRound": 1,
+            "requiredRole": "GENERAL_ADMIN",
+            "pipelineAttempt": 1,
+            "traceId": TRACE_ID,
+            "stateVersion": 5,
+        }
 
         def pause(invocation: NodeInvocation) -> NodeResult:
-            resumed = interrupt({"fixture": "pause"})
+            resumed = interrupt(pending_approval)
             log.append(("fixture.pause", invocation))
             return NodeResult.create(
                 "fixture_resumed", {"fixture_resume_seen": resumed is not None}
@@ -883,6 +907,7 @@ class SnapshotRunnerCompatibilityTest(unittest.TestCase):
         waiting = runner.invoke(event, _claim(event))
 
         self.assertIn("__interrupt__", waiting)
+        self.assertEqual(pending_approval, waiting["pendingApproval"])
         self.assertTrue(runner.is_duplicate(event))
         self.assertEqual(
             ["fixture.start", "fixture.guardrail", "fixture.work"],
@@ -912,6 +937,42 @@ class SnapshotRunnerCompatibilityTest(unittest.TestCase):
             [name for name, _ in log],
         )
         self.assertTrue(restarted.is_duplicate(resume_event))
+
+    def test_partial_coding_approval_authority_fails_at_runner_boundary(
+        self,
+    ) -> None:
+        snapshot = _interrupt_snapshot()
+        log: list[tuple[str, NodeInvocation]] = []
+
+        def pause(invocation: NodeInvocation) -> NodeResult:
+            payload = _fixture_pending_approval(invocation)
+            payload["approvalId"] = "61616161-6161-4161-8161-616161616161"
+            interrupt(payload)
+            return NodeResult.create("fixture_resumed")
+
+        handlers = {
+            "fixture.start": _fixed_handler(log, "fixture.start", "fixture_next"),
+            "fixture.guardrail": _fixed_handler(
+                log, "fixture.guardrail", "fixture_passed"
+            ),
+            "fixture.work": _fixed_handler(log, "fixture.work", "fixture_ready"),
+            "fixture.pause": pause,
+            "fixture.end": _fixed_handler(log, "fixture.end", None),
+        }
+        event = _event()
+        runner = SnapshotGraphRunner(
+            _Provider(_execution(snapshot)),
+            _registry(snapshot, handlers),
+            InMemorySaver(),
+        )
+
+        with self.assertRaisesRegex(
+            GraphExecutionError,
+            "approval interrupt is invalid",
+        ) as raised:
+            runner.invoke(event, _claim(event))
+
+        self.assertEqual("CONTRACT_VALIDATION_FAILED", raised.exception.code)
 
     def test_retry_continues_failed_node_without_replaying_completed_nodes(
         self,
@@ -1031,7 +1092,7 @@ class SnapshotRunnerCompatibilityTest(unittest.TestCase):
         log: list[tuple[str, NodeInvocation]] = []
 
         def pause(invocation: NodeInvocation) -> NodeResult:
-            interrupt({"fixture": "pause", "jobId": invocation.job_id})
+            interrupt(_fixture_pending_approval(invocation))
             log.append(("fixture.pause", invocation))
             return NodeResult.create("fixture_resumed")
 
@@ -1161,7 +1222,7 @@ class SnapshotRunnerCompatibilityTest(unittest.TestCase):
         log: list[tuple[str, NodeInvocation]] = []
 
         def pause(invocation: NodeInvocation) -> NodeResult:
-            interrupt({"fixture": "pause"})
+            interrupt(_fixture_pending_approval(invocation))
             log.append(("fixture.pause", invocation))
             return NodeResult.create("fixture_resumed")
 
@@ -1209,7 +1270,7 @@ class SnapshotRunnerCompatibilityTest(unittest.TestCase):
         log: list[tuple[str, NodeInvocation]] = []
 
         def pause(invocation: NodeInvocation) -> NodeResult:
-            interrupt({"fixture": "pause"})
+            interrupt(_fixture_pending_approval(invocation))
             log.append(("fixture.pause", invocation))
             return NodeResult.create("fixture_resumed")
 

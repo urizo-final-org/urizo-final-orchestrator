@@ -6,7 +6,11 @@ import json
 import threading
 import unittest
 
-from axms_coding_orchestrator.contracts import CodingJobRequested, QueuedJobReference
+from axms_coding_orchestrator.contracts import (
+    CodingJobRequested,
+    QueuedJobReference,
+    WorkerClaim,
+)
 from axms_coding_orchestrator.model_gateway import ServiceCredentialLease
 from axms_coding_orchestrator.worker_api import WorkerApiClient, WorkerApiError
 
@@ -55,6 +59,40 @@ def worker_server(responses: dict[str, tuple[int, dict[str, object]]]):
         thread.join(timeout=2)
 
 
+def pending_approval(
+    event: CodingJobRequested,
+    claim: WorkerClaim,
+) -> dict[str, object]:
+    return {
+        "schemaVersion": "1.0",
+        "approvalId": "61616161-6161-4161-8161-616161616161",
+        "jobId": event.job_id,
+        "profileVersionId": event.profile_version_id,
+        "nodeId": "scope_approval",
+        "stage": "SCOPE",
+        "stageRound": 1,
+        "requiredRole": "GENERAL_ADMIN",
+        "pipelineAttempt": event.pipeline_attempt,
+        "traceId": event.trace_id,
+        "stateVersion": claim.state_version,
+    }
+
+
+def pending_approval_projection(
+    value: dict[str, object],
+) -> dict[str, object]:
+    return {
+        field: value[field]
+        for field in (
+            "approvalId",
+            "nodeId",
+            "stage",
+            "stageRound",
+            "requiredRole",
+        )
+    }
+
+
 class WorkerApiClientTest(unittest.TestCase):
     def resolver(self) -> ServiceCredentialLease:
         return ServiceCredentialLease(b"spring-worker-test-token")
@@ -70,6 +108,10 @@ class WorkerApiClientTest(unittest.TestCase):
     def test_claim_heartbeat_and_outcome_preserve_lease_context(self) -> None:
         event = CodingJobRequested.from_dict(coding_event())
         claim_payload = worker_claim(event.to_dict())
+        expected_pending = pending_approval(
+            event,
+            WorkerClaim.from_dict(claim_payload, event, now=FIXED_NOW),
+        )
         job_id = event.job_id
         responses = {
             f"/internal/coding/worker/jobs/{job_id}/claim-context": (
@@ -96,6 +138,9 @@ class WorkerApiClientTest(unittest.TestCase):
                     "traceId": event.trace_id,
                     "stateVersion": 6,
                     "status": "WAITING_APPROVAL",
+                    "pendingApproval": pending_approval_projection(
+                        expected_pending
+                    ),
                 },
             ),
         }
@@ -106,7 +151,12 @@ class WorkerApiClientTest(unittest.TestCase):
             )
             claim = client.claim(resolved)
             heartbeat = client.heartbeat(claim, "heartbeat.test.0001")
-            receipt = client.outcome(claim, "WAITING_APPROVAL", "outcome.test.0001")
+            receipt = client.outcome(
+                claim,
+                "WAITING_APPROVAL",
+                "outcome.test.0001",
+                pending_approval=expected_pending,
+            )
 
         self.assertEqual(event.to_dict(), resolved.to_dict())
         self.assertEqual(claim.lease_id, heartbeat["leaseId"])
@@ -114,6 +164,100 @@ class WorkerApiClientTest(unittest.TestCase):
         self.assertTrue(all(item[2] == "Bearer spring-worker-test-token" for item in _Handler.observed))
         self.assertEqual(claim.lease_id, _Handler.observed[2][1]["leaseId"])
         self.assertEqual(claim.state_version, _Handler.observed[3][1]["expectedStateVersion"])
+
+    def test_waiting_outcome_preserves_exact_pending_approval(self) -> None:
+        event = CodingJobRequested.from_dict(coding_event())
+        claim_payload = worker_claim(event.to_dict())
+        claim = WorkerClaim.from_dict(claim_payload, event, now=FIXED_NOW)
+        expected = pending_approval(event, claim)
+        projected = pending_approval_projection(expected)
+        path = f"/internal/coding/worker/jobs/{event.job_id}/outcomes"
+        responses = {
+            path: (
+                200,
+                {
+                    "schemaVersion": "1.0",
+                    "jobId": event.job_id,
+                    "traceId": event.trace_id,
+                    "stateVersion": claim.state_version + 1,
+                    "status": "WAITING_APPROVAL",
+                    "pendingApproval": projected,
+                },
+            )
+        }
+
+        with worker_server(responses) as origin:
+            receipt = self.client(origin).outcome(
+                claim,
+                "WAITING_APPROVAL",
+                "outcome.test.pending-approval",
+                pending_approval=expected,
+            )
+
+        self.assertEqual(projected, receipt["pendingApproval"])
+        self.assertEqual(projected, _Handler.observed[0][1]["pendingApproval"])
+
+    def test_waiting_outcome_rejects_mismatched_approval_receipt(self) -> None:
+        event = CodingJobRequested.from_dict(coding_event())
+        claim = WorkerClaim.from_dict(
+            worker_claim(event.to_dict()), event, now=FIXED_NOW
+        )
+        expected = pending_approval(event, claim)
+        mismatched = pending_approval_projection(expected)
+        mismatched["stageRound"] = 2
+        path = f"/internal/coding/worker/jobs/{event.job_id}/outcomes"
+        responses = {
+            path: (
+                200,
+                {
+                    "schemaVersion": "1.0",
+                    "jobId": event.job_id,
+                    "traceId": event.trace_id,
+                    "stateVersion": claim.state_version + 1,
+                    "status": "WAITING_APPROVAL",
+                    "pendingApproval": mismatched,
+                },
+            )
+        }
+
+        with worker_server(responses) as origin:
+            with self.assertRaises(WorkerApiError) as raised:
+                self.client(origin).outcome(
+                    claim,
+                    "WAITING_APPROVAL",
+                    "outcome.test.mismatched-approval",
+                    pending_approval=expected,
+                )
+
+        self.assertEqual("WORKER_RESPONSE_INVALID", raised.exception.code)
+
+    def test_waiting_outcome_rejects_partial_approval_authority(self) -> None:
+        event = CodingJobRequested.from_dict(coding_event())
+        claim = WorkerClaim.from_dict(
+            worker_claim(event.to_dict()), event, now=FIXED_NOW
+        )
+        complete = pending_approval(event, claim)
+        client = self.client("http://127.0.0.1:1")
+
+        for field in (
+            "approvalId",
+            "nodeId",
+            "stage",
+            "stageRound",
+            "requiredRole",
+        ):
+            partial = dict(complete)
+            partial.pop(field)
+            with self.subTest(field=field), self.assertRaisesRegex(
+                ValueError,
+                "pending_approval is invalid",
+            ):
+                client.outcome(
+                    claim,
+                    "WAITING_APPROVAL",
+                    f"outcome.test.partial.{field}",
+                    pending_approval=partial,
+                )
 
     def test_resolve_rejects_unbound_or_mismatched_job_context(self) -> None:
         job = QueuedJobReference.from_dict(

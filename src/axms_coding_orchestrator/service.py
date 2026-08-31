@@ -276,7 +276,7 @@ class WorkerLoop:
             retryable, code = _classify_failure(failure)
             self._health.update(last_error_code=code)
             if claim is not None and event is not None:
-                return self._report_failure(event, claim, retryable, code)
+                return self._report_failure(claim, retryable, code)
             if isinstance(failure, WorkerApiError):
                 return event is None and _is_terminal_resolve_rejection(failure)
             return False
@@ -327,13 +327,35 @@ class WorkerLoop:
                 retryable=False,
             )
         outcome = result["status"]
+        pending_approval = result.get("pendingApproval")
+        if outcome == "WAITING_APPROVAL":
+            if not isinstance(pending_approval, Mapping):
+                raise GraphExecutionError(
+                    "CONTRACT_VALIDATION_FAILED",
+                    "The waiting Snapshot has no pending approval.",
+                    retryable=False,
+                )
+        elif pending_approval is not None:
+            raise GraphExecutionError(
+                "CONTRACT_VALIDATION_FAILED",
+                "The completed Snapshot returned a pending approval.",
+                retryable=False,
+            )
         try:
             self._heartbeat.ensure_current(claim)
-            self._worker_api.outcome(
-                claim,
-                outcome,
-                _outcome_key(claim, outcome),
-            )
+            if pending_approval is None:
+                self._worker_api.outcome(
+                    claim,
+                    outcome,
+                    _outcome_key(claim, outcome),
+                )
+            else:
+                self._worker_api.outcome(
+                    claim,
+                    outcome,
+                    _outcome_key(claim, outcome),
+                    pending_approval=pending_approval,
+                )
             return True
         except LeaseLostError:
             return False
@@ -343,7 +365,6 @@ class WorkerLoop:
 
     def _report_failure(
         self,
-        event: CodingJobRequested,
         claim: WorkerClaim,
         retryable: bool,
         code: str,
@@ -352,11 +373,7 @@ class WorkerLoop:
             self._heartbeat.ensure_current(claim)
         except LeaseLostError:
             return False
-        outcome = (
-            "RETRYABLE_FAILURE"
-            if retryable and event.attempt < self._max_attempts
-            else "PERMANENT_FAILURE"
-        )
+        outcome = "RETRYABLE_FAILURE" if retryable else "PERMANENT_FAILURE"
         try:
             self._worker_api.outcome(
                 claim,
