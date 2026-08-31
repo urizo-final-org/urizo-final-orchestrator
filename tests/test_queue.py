@@ -81,6 +81,68 @@ class ValkeyJobQueueTest(unittest.TestCase):
         self.assertNotIn("test-only-password", repr(queue))
         self.assertNotIn("profileVersionId", repr(delivery))
 
+    def test_natural_cms_lane_consumes_the_same_strict_job_reference(self) -> None:
+        natural_cms_queue_key = "axms:natural-cms:jobs:v1"
+        natural_cms_processing_key = f"{natural_cms_queue_key}:processing"
+        job = QueuedJobReference.from_dict(
+            {"jobId": "23232323-2323-4232-8232-232323232323"}
+        )
+        client = _FakeRedis()
+        client.lists[natural_cms_queue_key] = [job.to_json()]
+        client.lists[natural_cms_processing_key] = []
+        queue = ValkeyJobQueue(
+            "valkey",
+            6379,
+            0,
+            password="test-only-password",
+            queue_key=natural_cms_queue_key,
+        )
+        queue._client = client
+
+        delivery = queue.pop(5)
+
+        self.assertEqual(job.job_id, delivery.job.job_id)
+        self.assertEqual(
+            (
+                natural_cms_queue_key,
+                natural_cms_processing_key,
+                5,
+                "RIGHT",
+                "LEFT",
+            ),
+            client.observed,
+        )
+        self.assertEqual([job.to_json()], client.lists[natural_cms_processing_key])
+        queue.ack(delivery)
+        self.assertEqual([], client.lists[natural_cms_processing_key])
+
+    def test_natural_cms_requeue_and_recovery_never_touch_coding_processing(self) -> None:
+        natural_cms_queue_key = "axms:natural-cms:jobs:v1"
+        natural_cms_processing_key = f"{natural_cms_queue_key}:processing"
+        job = QueuedJobReference.from_dict(
+            {"jobId": "24242424-2424-4242-8242-242424242424"}
+        )
+        coding_pending = b'{"jobId":"25252525-2525-4252-8252-252525252525"}'
+        client = _FakeRedis(processing=[coding_pending])
+        client.lists[natural_cms_queue_key] = [job.to_json()]
+        client.lists[natural_cms_processing_key] = []
+        queue = ValkeyJobQueue(
+            "valkey",
+            6379,
+            0,
+            queue_key=natural_cms_queue_key,
+        )
+        queue._client = client
+
+        delivery = queue.pop(1)
+        queue.requeue(delivery)
+        delivery = queue.pop(1)
+        self.assertEqual(1, queue.recover_stale())
+
+        self.assertEqual([job.to_json()], client.lists[natural_cms_queue_key])
+        self.assertEqual([], client.lists[natural_cms_processing_key])
+        self.assertEqual([coding_pending], client.lists[PROCESSING_QUEUE_KEY])
+
     def test_unknown_queue_envelope_fails_closed(self) -> None:
         client = _FakeRedis([b'{"providerKey":"hidden"}'])
         queue = self.queue(client)

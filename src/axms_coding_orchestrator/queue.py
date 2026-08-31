@@ -1,4 +1,4 @@
-"""Valkey list consumer for the versioned coding-job queue."""
+"""Valkey list consumer for the fixed versioned worker queues."""
 
 from __future__ import annotations
 
@@ -10,6 +10,8 @@ from .contracts import QueuedJobReference, WorkerContractViolation
 
 QUEUE_KEY = "axms:coding:jobs:v1"
 PROCESSING_QUEUE_KEY = "axms:coding:jobs:v1:processing"
+NATURAL_CMS_QUEUE_KEY = "axms:natural-cms:jobs:v1"
+ALLOWED_QUEUE_KEYS = frozenset({QUEUE_KEY, NATURAL_CMS_QUEUE_KEY})
 MAX_JOB_REFERENCE_BYTES = 128
 
 
@@ -37,13 +39,14 @@ class ValkeyJobQueue:
         queue_key: str = QUEUE_KEY,
         socket_timeout_seconds: float = 10.0,
     ) -> None:
-        if queue_key != QUEUE_KEY:
-            raise ValueError("queue_key must use the versioned coding queue")
+        if queue_key not in ALLOWED_QUEUE_KEYS:
+            raise ValueError("queue_key must use a versioned worker queue")
         self._host = host
         self._port = port
         self._database = database
         self._password = password
         self._queue_key = queue_key
+        self._processing_queue_key = f"{queue_key}:processing"
         self._socket_timeout_seconds = socket_timeout_seconds
         self._client: Any = None
 
@@ -68,7 +71,7 @@ class ValkeyJobQueue:
             self.recover_stale()
         except Exception:
             self.close()
-            raise QueueError("Valkey coding queue is unavailable") from None
+            raise QueueError("Valkey worker queue is unavailable") from None
         return self
 
     def healthy(self) -> bool:
@@ -79,51 +82,51 @@ class ValkeyJobQueue:
 
     def pop(self, timeout_seconds: int) -> QueueDelivery | None:
         if self._client is None:
-            raise QueueError("Valkey coding queue is not open")
+            raise QueueError("Valkey worker queue is not open")
         try:
             raw = self._client.blmove(
                 self._queue_key,
-                PROCESSING_QUEUE_KEY,
+                self._processing_queue_key,
                 timeout_seconds,
                 src="RIGHT",
                 dest="LEFT",
             )
         except Exception:
-            raise QueueError("Valkey coding queue read failed") from None
+            raise QueueError("Valkey worker queue read failed") from None
         if raw is None:
             return None
         if not isinstance(raw, bytes) or not 1 <= len(raw) <= MAX_JOB_REFERENCE_BYTES:
             self._discard_poison(raw)
-            raise QueueError("Valkey coding queue job reference size is invalid")
+            raise QueueError("Valkey worker queue job reference size is invalid")
         try:
             job = QueuedJobReference.from_json(raw)
         except WorkerContractViolation:
             self._discard_poison(raw)
-            raise QueueError("Valkey coding queue job reference is invalid") from None
+            raise QueueError("Valkey worker queue job reference is invalid") from None
         return QueueDelivery(job=job, _raw=raw)
 
     def ack(self, delivery: QueueDelivery) -> None:
         client = self._require_client()
         try:
-            removed = client.lrem(PROCESSING_QUEUE_KEY, 1, delivery._raw)
+            removed = client.lrem(self._processing_queue_key, 1, delivery._raw)
         except Exception:
-            raise QueueError("Valkey coding queue acknowledgement failed") from None
+            raise QueueError("Valkey worker queue acknowledgement failed") from None
         if removed != 1:
-            raise QueueError("Valkey coding queue delivery is no longer pending")
+            raise QueueError("Valkey worker queue delivery is no longer pending")
 
     def requeue(self, delivery: QueueDelivery) -> None:
         client = self._require_client()
         try:
             moved = client.lmove(
-                PROCESSING_QUEUE_KEY,
+                self._processing_queue_key,
                 self._queue_key,
                 src="LEFT",
                 dest="RIGHT",
             )
         except Exception:
-            raise QueueError("Valkey coding queue requeue failed") from None
+            raise QueueError("Valkey worker queue requeue failed") from None
         if moved != delivery._raw:
-            raise QueueError("Valkey coding queue processing order changed")
+            raise QueueError("Valkey worker queue processing order changed")
 
     def recover_stale(self) -> int:
         client = self._require_client()
@@ -131,7 +134,7 @@ class ValkeyJobQueue:
         try:
             while True:
                 moved = client.lmove(
-                    PROCESSING_QUEUE_KEY,
+                    self._processing_queue_key,
                     self._queue_key,
                     src="LEFT",
                     dest="RIGHT",
@@ -140,19 +143,19 @@ class ValkeyJobQueue:
                     return recovered
                 recovered += 1
         except Exception:
-            raise QueueError("Valkey coding queue recovery failed") from None
+            raise QueueError("Valkey worker queue recovery failed") from None
 
     def _discard_poison(self, raw: Any) -> None:
         if not isinstance(raw, bytes):
             return
         try:
-            self._require_client().lrem(PROCESSING_QUEUE_KEY, 1, raw)
+            self._require_client().lrem(self._processing_queue_key, 1, raw)
         except Exception:
             pass
 
     def _require_client(self) -> Any:
         if self._client is None:
-            raise QueueError("Valkey coding queue is not open")
+            raise QueueError("Valkey worker queue is not open")
         return self._client
 
     def close(self) -> None:

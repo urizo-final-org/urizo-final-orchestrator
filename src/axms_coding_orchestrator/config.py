@@ -67,6 +67,7 @@ class RuntimeSettings:
     valkey_database: int
     valkey_password_file: Path | None
     queue_key: str
+    natural_cms_queue_key: str
     health_host: str
     health_port: int
     queue_block_seconds: int
@@ -104,6 +105,13 @@ class RuntimeSettings:
         queue_key = values.get("AXMS_QUEUE_KEY", "axms:coding:jobs:v1")
         if queue_key != "axms:coding:jobs:v1":
             raise ConfigurationError("AXMS_QUEUE_KEY must use the versioned coding queue")
+        natural_cms_queue_key = values.get(
+            "AXMS_NATURAL_CMS_QUEUE_KEY", "axms:natural-cms:jobs:v1"
+        )
+        if natural_cms_queue_key != "axms:natural-cms:jobs:v1":
+            raise ConfigurationError(
+                "AXMS_NATURAL_CMS_QUEUE_KEY must use the versioned Natural CMS queue"
+            )
         password_file = values.get("AXMS_VALKEY_PASSWORD_FILE")
         return cls(
             spring_origin=spring_origin,
@@ -131,6 +139,7 @@ class RuntimeSettings:
             valkey_database=_integer(values, "AXMS_VALKEY_DATABASE", 0, 0, 15),
             valkey_password_file=Path(password_file) if password_file else None,
             queue_key=queue_key,
+            natural_cms_queue_key=natural_cms_queue_key,
             health_host=health_host,
             health_port=_integer(values, "AXMS_HEALTH_PORT", 8090, 1, 65535),
             queue_block_seconds=_integer(values, "AXMS_QUEUE_BLOCK_SECONDS", 5, 1, 60),

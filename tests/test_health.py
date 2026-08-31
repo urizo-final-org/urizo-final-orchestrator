@@ -48,6 +48,25 @@ class HealthStateTest(unittest.TestCase):
         self.assertEqual(503, status)
         self.assertNotIn("dependency detail", raw.decode("utf-8"))
 
+    def test_readiness_requires_both_worker_threads(self) -> None:
+        running = {"coding": True, "naturalCms": False}
+        state = HealthState()
+        state.bind_dependency_probes(
+            checkpoint=lambda: True,
+            queue=lambda: True,
+            spring=lambda: True,
+            worker=lambda: all(running.values()),
+        )
+
+        status, raw = state.response(True)
+        self.assertEqual(503, status)
+        self.assertEqual("DOWN", json.loads(raw)["checks"]["worker"])
+
+        running["naturalCms"] = True
+        status, raw = state.response(True)
+        self.assertEqual(200, status)
+        self.assertEqual("UP", json.loads(raw)["checks"]["worker"])
+
 
 if __name__ == "__main__":
     unittest.main()
