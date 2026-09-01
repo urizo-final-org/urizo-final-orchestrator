@@ -31,6 +31,36 @@ class CodingJobRequestedContractTest(unittest.TestCase):
         self.assertFalse(claim.resume)
         self.assertNotIn("Inspect only", repr(claim.snapshot))
 
+    def test_production_snapshot_without_the_legacy_plan_node_is_accepted(self) -> None:
+        """The profile-bound graph renamed 'plan' to 'analyze'; the shared claim
+        validator must not demand a node the active Snapshot no longer defines."""
+
+        production_nodes = [
+            "start",
+            "guardrail",
+            "analyze",
+            "scope_approval",
+            "code",
+            "review",
+            "rework_gate",
+            "preview",
+            "preview_approval",
+            "pr_request",
+            "github_approval",
+            "cms_approval",
+            "deploy_approval",
+            "deploy_request",
+            "end",
+        ]
+        event = CodingJobRequested.from_dict(coding_event())
+        payload = worker_claim(event.to_dict())
+        payload["snapshot"]["allowedNodes"] = production_nodes
+
+        claim = WorkerClaim.from_dict(payload, event, now=FIXED_NOW)
+
+        self.assertNotIn("plan", claim.snapshot.to_dict()["allowedNodes"])
+        self.assertEqual(production_nodes, claim.snapshot.to_dict()["allowedNodes"])
+
     def test_unknown_event_field_is_rejected(self) -> None:
         payload = coding_event()
         payload["provider"] = "OPENAI"

@@ -582,9 +582,16 @@ def main() -> None:
                 )
             )
         )
+        # The code stage call is synchronous on the Spring side and legitimately runs
+        # for minutes - model turns, re-asked misses and tool executions all happen
+        # inside one request. A ten-second socket timeout made the worker abandon every
+        # such stage mid-flight: Spring kept executing alone and the Job was left
+        # RUNNING with an expired lease. The heartbeat thread keeps the lease alive
+        # while this client waits, so the timeout only needs to outlast one stage.
         coding_domain_client = SpringCodingDomainClient(
             settings.spring_origin,
             credential_resolver,
+            timeout_seconds=180.0,
         )
         coding_registry = register_coding_node_handlers(
             build_common_node_registry(),
