@@ -90,12 +90,14 @@ def register_natural_cms_node_handlers(
             node_types=node_types,
             result_ports=ports,
             handler=_stage_handler(handler_key, dependencies),
+            config_validator=_empty_config_validator(handler_key),
         )
     registry.register(
         "cms.approval",
         node_types=["approval"],
         result_ports=["approved", "rejected"],
         handler=_approval_handler(dependencies),
+        config_validator=_approval_config_failure,
     )
     return registry
 
@@ -107,8 +109,7 @@ def _stage_handler(
     expected_ports = NATURAL_CMS_HANDLER_CONTRACTS[handler_key][1]
 
     def handle(invocation: NodeInvocation) -> NodeResult:
-        if invocation.config:
-            raise _contract_failure(f"{handler_key} does not accept node config")
+        _require_valid_config(_empty_config_validator(handler_key)(invocation.config))
         try:
             round_number, rounds = _next_round(invocation)
             result_id = _result_id(invocation, handler_key, round_number)
@@ -159,8 +160,7 @@ def _stage_handler(
 
 def _approval_handler(dependencies: NaturalCmsHandlerDependencies) -> Any:
     def handle(invocation: NodeInvocation) -> NodeResult:
-        if invocation.config != {"stage": "PREVIEW", "requiredRole": "GENERAL_ADMIN"}:
-            raise _contract_failure("cms.approval config is invalid")
+        _require_valid_config(_approval_config_failure(invocation.config))
         last = invocation.context.get("naturalCmsLastResult")
         if not isinstance(last, Mapping) or last.get("handlerKey") != "cms.preview":
             raise _state_conflict("Natural CMS approval has no current preview.")
@@ -213,6 +213,26 @@ def _approval_handler(dependencies: NaturalCmsHandlerDependencies) -> Any:
         return NodeResult.create(port)
 
     return handle
+
+
+def _empty_config_validator(handler_key: str):
+    def validate(config: Mapping[str, Any]) -> str | None:
+        if config:
+            return f"{handler_key} does not accept node config"
+        return None
+
+    return validate
+
+
+def _approval_config_failure(config: Mapping[str, Any]) -> str | None:
+    if config != {"stage": "PREVIEW", "requiredRole": "GENERAL_ADMIN"}:
+        return "cms.approval config is invalid"
+    return None
+
+
+def _require_valid_config(failure: str | None) -> None:
+    if failure is not None:
+        raise _contract_failure(failure)
 
 
 def _validate_job(invocation: NodeInvocation, job: NaturalCmsJob) -> None:

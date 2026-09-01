@@ -214,6 +214,8 @@ class SnapshotConfig(_FactoryOnly):
             "max_attempts",
             _positive_integer(payload["maxAttempts"], "config.maxAttempts"),
         )
+        if result.max_attempts != 3:
+            raise SnapshotContractViolation("config.maxAttempts must equal 3")
         object.__setattr__(result, "loop_limits", limits)
         return result
 
