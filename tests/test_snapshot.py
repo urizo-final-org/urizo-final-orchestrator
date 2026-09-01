@@ -128,6 +128,14 @@ class VersionedSnapshotLoaderTest(unittest.TestCase):
         with self.assertRaisesRegex(SnapshotContractViolation, "maxNodes"):
             VersionedSnapshot.from_dict(payload)
 
+        for max_attempts in (1, 2, 4):
+            payload = valid_snapshot()
+            payload["config"]["maxAttempts"] = max_attempts  # type: ignore[index]
+            with self.subTest(max_attempts=max_attempts), self.assertRaisesRegex(
+                SnapshotContractViolation, "maxAttempts"
+            ):
+                VersionedSnapshot.from_dict(payload)
+
     def test_identifiers_and_json_safe_settings_fail_closed(self) -> None:
         payload = valid_snapshot()
         payload["nodes"][0]["handlerKey"] = "Invalid Handler"  # type: ignore[index]

@@ -107,16 +107,19 @@ class NodeContractTest(unittest.TestCase):
 class NodeRegistryTest(unittest.TestCase):
     def test_registers_and_resolves_one_source_handler_contract(self) -> None:
         handler = lambda invocation: NodeResult.create("done", invocation.context)
+        config_validator = lambda config: None
         registry = NodeRegistry().register(
             "fixture.analyze",
             node_types=["agent"],
             result_ports=["done", "retry"],
             handler=handler,
+            config_validator=config_validator,
         )
 
         registration = registry.resolve("fixture.analyze")
 
         self.assertIs(handler, registration.handler)
+        self.assertIs(config_validator, registration.config_validator)
         self.assertEqual(frozenset({"agent"}), registration.node_types)
         self.assertEqual(frozenset({"done", "retry"}), registration.result_ports)
         self.assertEqual(("fixture.analyze",), registry.registered_keys)
@@ -159,6 +162,15 @@ class NodeRegistryTest(unittest.TestCase):
 
         with self.assertRaisesRegex(NodeRegistryViolation, "unregistered"):
             NodeRegistry().resolve("fixture.missing")
+
+        with self.assertRaisesRegex(NodeRegistryViolation, "config validator"):
+            NodeRegistry().register(
+                "fixture.end",
+                node_types=["end"],
+                result_ports=[],
+                handler=handler,
+                config_validator=object(),  # type: ignore[arg-type]
+            )
 
 
 if __name__ == "__main__":

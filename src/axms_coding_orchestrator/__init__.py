@@ -32,6 +32,7 @@ from .snapshot import (
     validate_snapshot,
 )
 from .node_runtime import (
+    NodeConfigValidator,
     NodeContractViolation,
     NodeHandler,
     NodeHandlerRegistration,
@@ -113,6 +114,7 @@ __all__ = [
     "ModelTurnRequest",
     "ModelTurnResponse",
     "NodeContractViolation",
+    "NodeConfigValidator",
     "NodeHandler",
     "NodeHandlerRegistration",
     "NodeInvocation",

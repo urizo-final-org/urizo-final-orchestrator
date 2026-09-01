@@ -17,8 +17,11 @@ from axms_coding_orchestrator.default_coding_snapshot import (
     default_coding_snapshot,
     default_coding_snapshot_dict,
 )
-from axms_coding_orchestrator.graph_builder import SnapshotGraphBuilder
-from axms_coding_orchestrator.snapshot import load_snapshot_json
+from axms_coding_orchestrator.graph_builder import (
+    SnapshotGraphBuildError,
+    SnapshotGraphBuilder,
+)
+from axms_coding_orchestrator.snapshot import VersionedSnapshot, load_snapshot_json
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "llm-ops-coding-handler.snapshot.valid.json"
@@ -79,6 +82,31 @@ class DefaultCodingSnapshotTest(unittest.TestCase):
             })),
             registry.registered_keys,
         )
+
+    def test_feature_handler_configs_are_validated_before_execution(self) -> None:
+        dependencies = CodingHandlerDependencies(
+            _Domain(), PreparedResultCodingStageExecutor()
+        )
+        invalid_configs = {
+            "analyze": {"unknown": True},
+            "deploy_request": {"mode": "execute"},
+            "scope_approval": {"stage": "CANDIDATE", "requiredRole": "GENERAL_ADMIN"},
+            "rework_gate": {"maxReworkRounds": 0},
+        }
+
+        for node_id, config in invalid_configs.items():
+            payload = default_coding_snapshot_dict()
+            node = next(item for item in payload["nodes"] if item["id"] == node_id)
+            node["config"] = config
+            snapshot = VersionedSnapshot.from_dict(payload)
+            registry = register_coding_node_handlers(
+                build_common_node_registry(), dependencies
+            )
+
+            with self.subTest(node_id=node_id), self.assertRaisesRegex(
+                SnapshotGraphBuildError, "config"
+            ):
+                SnapshotGraphBuilder(registry).compile(snapshot)
 
 
 if __name__ == "__main__":

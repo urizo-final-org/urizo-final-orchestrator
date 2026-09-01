@@ -168,12 +168,17 @@ class NodeHandler(Protocol):
     def __call__(self, invocation: NodeInvocation) -> NodeResult: ...
 
 
+class NodeConfigValidator(Protocol):
+    def __call__(self, config: Mapping[str, Any]) -> str | None: ...
+
+
 @dataclass(frozen=True, slots=True, init=False)
 class NodeHandlerRegistration(_FactoryOnly):
     handler_key: str
     node_types: frozenset[str]
     result_ports: frozenset[str]
     handler: NodeHandler = field(repr=False, compare=False)
+    config_validator: NodeConfigValidator = field(repr=False, compare=False)
 
 
 class NodeRegistry:
@@ -191,6 +196,7 @@ class NodeRegistry:
         node_types: Iterable[str],
         result_ports: Iterable[str],
         handler: NodeHandler,
+        config_validator: NodeConfigValidator | None = None,
     ) -> NodeRegistry:
         try:
             key = _matched(handler_key, HANDLER_KEY, "registry.handlerKey", 128)
@@ -202,11 +208,15 @@ class NodeRegistry:
         ports = _string_set(result_ports, "registry.resultPorts", None, RESULT_PORT)
         if not callable(handler):
             raise NodeRegistryViolation("registry handler must be callable")
+        validator = _accept_any_config if config_validator is None else config_validator
+        if not callable(validator):
+            raise NodeRegistryViolation("registry config validator must be callable")
         registration = object.__new__(NodeHandlerRegistration)
         object.__setattr__(registration, "handler_key", key)
         object.__setattr__(registration, "node_types", types)
         object.__setattr__(registration, "result_ports", ports)
         object.__setattr__(registration, "handler", handler)
+        object.__setattr__(registration, "config_validator", validator)
         self._registrations[key] = registration
         return self
 
@@ -254,6 +264,11 @@ def _string_set(
     if len(results) != len(set(results)):
         raise NodeRegistryViolation(f"{field_name} contains duplicates")
     return frozenset(results)
+
+
+def _accept_any_config(config: Mapping[str, Any]) -> str | None:
+    del config
+    return None
 
 
 def _freeze_object(value: Any, field_name: str) -> Mapping[str, JsonValue]:

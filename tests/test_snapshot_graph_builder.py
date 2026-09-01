@@ -26,6 +26,7 @@ TOOL_CALL_ID = "50505050-5050-4050-8050-505050505050"
 
 
 Handler = Callable[[NodeInvocation], NodeResult]
+ConfigValidator = Callable[[Mapping[str, Any]], str | None]
 
 
 def _node(
@@ -218,18 +219,24 @@ def _registry(
     skip: frozenset[str] = frozenset(),
     node_type_overrides: Mapping[str, Iterable[str]] | None = None,
     port_overrides: Mapping[str, Iterable[str]] | None = None,
+    config_validators: Mapping[str, ConfigValidator] | None = None,
 ) -> NodeRegistry:
     node_type_overrides = node_type_overrides or {}
     port_overrides = port_overrides or {}
+    config_validators = config_validators or {}
     registry = NodeRegistry()
     for node in snapshot.nodes:
         if node.handler_key in skip:
             continue
+        options: dict[str, Any] = {}
+        if node.handler_key in config_validators:
+            options["config_validator"] = config_validators[node.handler_key]
         registry.register(
             node.handler_key,
             node_types=node_type_overrides.get(node.handler_key, [node.node_type]),
             result_ports=port_overrides.get(node.handler_key, node.result_ports),
             handler=handlers[node.handler_key],
+            **options,
         )
     return registry
 
@@ -406,6 +413,24 @@ class SnapshotGraphBuilderTest(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(SnapshotGraphBuildError, "result ports"):
                     SnapshotGraphBuilder(registry).compile(snapshot)
+
+    def test_build_rejects_config_that_fails_the_registered_validator(self) -> None:
+        snapshot = _linear_snapshot()
+        log: list[tuple[str, NodeInvocation]] = []
+        registry = _registry(
+            snapshot,
+            _linear_handlers(log),
+            config_validators={
+                "fixture.work": lambda config: "fixture.work config is invalid"
+            },
+        )
+
+        with self.assertRaisesRegex(
+            SnapshotGraphBuildError, "fixture.work config is invalid"
+        ):
+            SnapshotGraphBuilder(registry).compile(snapshot)
+
+        self.assertEqual([], log)
 
     def test_execution_rejects_an_undeclared_fixture_runtime_port(self) -> None:
         snapshot = _linear_snapshot()

@@ -8,6 +8,11 @@ from unittest.mock import Mock
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import interrupt
 
+from axms_coding_orchestrator.coding_handlers import (
+    CodingHandlerDependencies,
+    PreparedResultCodingStageExecutor,
+    register_coding_node_handlers,
+)
 from axms_coding_orchestrator.common_handlers import build_common_node_registry
 from axms_coding_orchestrator.contracts import (
     CodingJobRequested,
@@ -188,6 +193,71 @@ def _common_approval_snapshot() -> VersionedSnapshot:
             _edge("check", "failed", "end"),
             _edge("approval", "approved", "end"),
         ],
+    )
+
+
+def _common_success_snapshot() -> VersionedSnapshot:
+    return _snapshot(
+        [
+            _node("start", "start", "common.start", ["next"]),
+            _node(
+                "guardrail",
+                "guardrail",
+                "common.guardrail",
+                ["passed", "failed"],
+                {"locked": True},
+            ),
+            _node("check", "check", "common.check", ["passed", "failed"]),
+            _node("end", "end", "common.end", []),
+        ],
+        [
+            _edge("start", "next", "guardrail"),
+            _edge("guardrail", "passed", "check"),
+            _edge("guardrail", "failed", "end"),
+            _edge("check", "passed", "end"),
+            _edge("check", "failed", "end"),
+        ],
+    )
+
+
+def _common_approval_test_registry() -> NodeRegistry:
+    production = build_common_node_registry()
+    registry = NodeRegistry()
+    for handler_key in production.registered_keys:
+        if handler_key == "common.approval":
+            continue
+        registration = production.resolve(handler_key)
+        registry.register(
+            handler_key,
+            node_types=registration.node_types,
+            result_ports=registration.result_ports,
+            handler=registration.handler,
+            config_validator=registration.config_validator,
+        )
+
+    def approval(invocation: NodeInvocation) -> NodeResult:
+        decision = interrupt(
+            {
+                "schemaVersion": "1.0",
+                "jobId": invocation.job_id,
+                "profileVersionId": invocation.profile_version_id,
+                "nodeId": invocation.node_id,
+                "traceId": invocation.trace_id,
+                "stateVersion": invocation.state_version,
+            }
+        )
+        if decision is not True:
+            raise AssertionError("fixture approval received an invalid decision")
+        return NodeResult.create("approved")
+
+    return registry.register(
+        "common.approval",
+        node_types=["approval"],
+        result_ports=["approved"],
+        handler=approval,
+        config_validator=lambda config: (
+            None if not config else "fixture approval config is invalid"
+        ),
     )
 
 
@@ -415,6 +485,65 @@ class _Heartbeat:
 
 
 class SnapshotRunnerCompatibilityTest(unittest.TestCase):
+    def test_common_approval_is_rejected_by_the_production_registry(self) -> None:
+        with self.assertRaisesRegex(
+            SnapshotGraphBuildError, "common.approval is not supported"
+        ):
+            SnapshotGraphBuilder(build_common_node_registry()).compile(
+                _common_approval_snapshot()
+            )
+
+    def test_common_handler_configs_are_validated_before_execution(self) -> None:
+        invalid_configs = {
+            "start": {"unknown": True},
+            "guardrail": {"locked": True, "unknown": True},
+            "check": {"unknown": True},
+            "end": {"unknown": True},
+        }
+
+        for node_id, config in invalid_configs.items():
+            payload = _common_success_snapshot().to_dict()
+            node = next(item for item in payload["nodes"] if item["id"] == node_id)
+            node["config"] = config
+            snapshot = VersionedSnapshot.from_dict(payload)
+
+            with self.subTest(node_id=node_id), self.assertRaisesRegex(
+                SnapshotGraphBuildError, "config"
+            ):
+                SnapshotGraphBuilder(build_common_node_registry()).compile(snapshot)
+
+    def test_common_success_snapshot_completes_through_the_worker_loop(self) -> None:
+        snapshot = _common_success_snapshot()
+        event = _event()
+        checkpointer = InMemorySaver()
+        runner = SnapshotGraphRunner(
+            _Provider(_execution(snapshot, context=event.job_payload)),
+            build_common_node_registry(),
+            checkpointer,
+        )
+        worker = _OutcomeWorker(event, _claim(event))
+        heartbeat = _Heartbeat()
+        loop = WorkerLoop(
+            _UnusedQueue(),
+            worker,  # type: ignore[arg-type]
+            runner,
+            heartbeat,  # type: ignore[arg-type]
+            HealthState(),
+            queue_block_seconds=1,
+            max_attempts=1,
+            max_backoff_seconds=1,
+            sleeper=lambda _delay: None,
+        )
+
+        self.assertTrue(
+            loop.process(QueuedJobReference.from_dict({"jobId": event.job_id}))
+        )
+        self.assertEqual([("COMPLETED", None)], worker.outcomes)
+        self.assertEqual([event.job_id], heartbeat.started)
+        self.assertEqual([event.job_id], heartbeat.stopped)
+        self.assertEqual({event.job_id}, set(checkpointer.storage))
+        self.assertTrue(runner.is_duplicate(event))
+
     def test_common_failure_ports_must_route_directly_to_end(self) -> None:
         original = _common_approval_snapshot()
 
@@ -432,9 +561,7 @@ class SnapshotRunnerCompatibilityTest(unittest.TestCase):
                 SnapshotGraphBuildError,
                 "failed port must route directly to end",
             ):
-                SnapshotGraphBuilder(build_common_node_registry()).compile(
-                    snapshot
-                )
+                SnapshotGraphBuilder(_common_approval_test_registry()).compile(snapshot)
 
     def test_common_invalid_or_missing_digest_terminates_without_approval_interrupt(
         self,
@@ -453,7 +580,7 @@ class SnapshotRunnerCompatibilityTest(unittest.TestCase):
                 context[field] = value
             runner = SnapshotGraphRunner(
                 _Provider(_execution(snapshot, context=context)),
-                build_common_node_registry(),
+                _common_approval_test_registry(),
                 InMemorySaver(),
             )
 
@@ -469,7 +596,7 @@ class SnapshotRunnerCompatibilityTest(unittest.TestCase):
         checkpointer = InMemorySaver()
         runner = SnapshotGraphRunner(
             provider,
-            build_common_node_registry(),
+            _common_approval_test_registry(),
             checkpointer,
         )
         waiting = runner.invoke(event, _claim(event))
@@ -484,7 +611,7 @@ class SnapshotRunnerCompatibilityTest(unittest.TestCase):
         )
         restarted = SnapshotGraphRunner(
             provider,
-            build_common_node_registry(),
+            _common_approval_test_registry(),
             checkpointer,
         )
         completed = restarted.invoke(
@@ -546,7 +673,7 @@ class SnapshotRunnerCompatibilityTest(unittest.TestCase):
             },
         )
         checkpointer = InMemorySaver()
-        registry = build_common_node_registry()
+        registry = _common_approval_test_registry()
         runner = SnapshotGraphRunner(provider, registry, checkpointer)
 
         waiting = runner.invoke(initial_event, _claim(initial_event))
@@ -864,6 +991,74 @@ class SnapshotRunnerCompatibilityTest(unittest.TestCase):
             [("PERMANENT_FAILURE", "CONTRACT_VALIDATION_FAILED")],
             worker.outcomes,
         )
+
+    def test_production_registry_rejects_unregistered_handler_after_claim(self) -> None:
+        snapshot = _snapshot(
+            [
+                _node("start", "start", "common.start", ["next"]),
+                _node(
+                    "guardrail",
+                    "guardrail",
+                    "common.guardrail",
+                    ["passed", "failed"],
+                    {"locked": True},
+                ),
+                _node(
+                    "rework_gate",
+                    "check",
+                    "coding.rework_gate",
+                    ["retry", "handover"],
+                    {"maxReworkRounds": 3},
+                ),
+                _node(
+                    "unregistered",
+                    "check",
+                    "coding.unregistered",
+                    ["completed"],
+                ),
+                _node("end", "end", "common.end", []),
+            ],
+            [
+                _edge("start", "next", "guardrail"),
+                _edge("guardrail", "passed", "rework_gate"),
+                _edge("guardrail", "failed", "end"),
+                _edge("rework_gate", "retry", "unregistered"),
+                _edge("rework_gate", "handover", "end"),
+                _edge("unregistered", "completed", "end"),
+            ],
+        )
+        registry = register_coding_node_handlers(
+            build_common_node_registry(),
+            CodingHandlerDependencies(Mock(), PreparedResultCodingStageExecutor()),
+        )
+        runner = SnapshotGraphRunner(
+            _Provider(_execution(snapshot)), registry, InMemorySaver()
+        )
+        event = _event()
+        worker = _OutcomeWorker(event, _claim(event))
+        heartbeat = _Heartbeat()
+        loop = WorkerLoop(
+            _UnusedQueue(),
+            worker,  # type: ignore[arg-type]
+            runner,
+            heartbeat,  # type: ignore[arg-type]
+            HealthState(),
+            queue_block_seconds=1,
+            max_attempts=3,
+            max_backoff_seconds=1,
+            sleeper=lambda _delay: None,
+        )
+
+        self.assertTrue(
+            loop.process(QueuedJobReference.from_dict({"jobId": event.job_id}))
+        )
+        self.assertEqual(1, worker.claim_calls)
+        self.assertEqual(
+            [("PERMANENT_FAILURE", "CONTRACT_VALIDATION_FAILED")],
+            worker.outcomes,
+        )
+        self.assertEqual([event.job_id], heartbeat.started)
+        self.assertEqual([event.job_id], heartbeat.stopped)
 
     def test_interrupt_resumes_same_checkpoint_after_runner_restart(self) -> None:
         snapshot = _interrupt_snapshot()
@@ -1265,7 +1460,7 @@ class SnapshotRunnerCompatibilityTest(unittest.TestCase):
     def test_resume_rejects_same_profile_id_content_drift_by_digest(self) -> None:
         original = _interrupt_snapshot()
         changed_payload = original.to_dict()
-        changed_payload["config"]["maxAttempts"] += 1
+        changed_payload["guardrailProfileKey"] = "fixture.changed"
         changed = VersionedSnapshot.from_dict(changed_payload)
         log: list[tuple[str, NodeInvocation]] = []
 
