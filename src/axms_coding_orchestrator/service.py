@@ -1,4 +1,4 @@
-"""Long-running local/full-profile coding runtime service."""
+"""Long-running local/full-profile LangGraph runtime service."""
 
 from __future__ import annotations
 
@@ -36,13 +36,17 @@ from .model_gateway import (
     ModelGatewayClient,
     ModelGatewayRemoteError,
 )
-from .natural_cms_domain_client import SpringNaturalCmsDomainClient
+from .natural_cms_domain_client import (
+    NaturalCmsDomainClientError,
+    SpringNaturalCmsDomainClient,
+)
 from .natural_cms_handlers import (
     NaturalCmsHandlerDependencies,
     SpringGatewayNaturalCmsStageExecutor,
     register_natural_cms_node_handlers,
 )
-from .profile_version_client import ProfileVersionClient
+from .natural_cms_runner import NaturalCmsSnapshotRunner
+from .profile_version_client import ProfileVersionClient, ProfileVersionClientError
 from .queue import QueueError, ValkeyJobQueue
 from .snapshot_runner import (
     CodingGraphRunnerAdapter,
@@ -72,6 +76,7 @@ class HealthState:
         self._checkpoint_probe: Callable[[], bool] | None = None
         self._queue_probe: Callable[[], bool] | None = None
         self._spring_probe: Callable[[], bool] | None = None
+        self._worker_probe: Callable[[], bool] | None = None
 
     def bind_dependency_probes(
         self,
@@ -79,11 +84,13 @@ class HealthState:
         checkpoint: Callable[[], bool],
         queue: Callable[[], bool],
         spring: Callable[[], bool],
+        worker: Callable[[], bool] | None = None,
     ) -> None:
         with self._lock:
             self._checkpoint_probe = checkpoint
             self._queue_probe = queue
             self._spring_probe = spring
+            self._worker_probe = worker
 
     def update(self, **changes: Any) -> None:
         with self._lock:
@@ -98,11 +105,17 @@ class HealthState:
                     self._queue_probe,
                     self._spring_probe,
                 )
+                worker_probe = self._worker_probe
             results = tuple(_safe_probe(probe) for probe in probes)
             self.update(
                 checkpoint=results[0],
                 queue=results[1],
                 spring=results[2],
+                **(
+                    {"worker": _safe_probe(worker_probe)}
+                    if worker_probe is not None
+                    else {}
+                ),
             )
         with self._lock:
             status = _Status(
@@ -263,7 +276,7 @@ class WorkerLoop:
             retryable, code = _classify_failure(failure)
             self._health.update(last_error_code=code)
             if claim is not None and event is not None:
-                return self._report_failure(event, claim, retryable, code)
+                return self._report_failure(claim, retryable, code)
             if isinstance(failure, WorkerApiError):
                 return event is None and _is_terminal_resolve_rejection(failure)
             return False
@@ -314,13 +327,35 @@ class WorkerLoop:
                 retryable=False,
             )
         outcome = result["status"]
+        pending_approval = result.get("pendingApproval")
+        if outcome == "WAITING_APPROVAL":
+            if not isinstance(pending_approval, Mapping):
+                raise GraphExecutionError(
+                    "CONTRACT_VALIDATION_FAILED",
+                    "The waiting Snapshot has no pending approval.",
+                    retryable=False,
+                )
+        elif pending_approval is not None:
+            raise GraphExecutionError(
+                "CONTRACT_VALIDATION_FAILED",
+                "The completed Snapshot returned a pending approval.",
+                retryable=False,
+            )
         try:
             self._heartbeat.ensure_current(claim)
-            self._worker_api.outcome(
-                claim,
-                outcome,
-                _outcome_key(claim, outcome),
-            )
+            if pending_approval is None:
+                self._worker_api.outcome(
+                    claim,
+                    outcome,
+                    _outcome_key(claim, outcome),
+                )
+            else:
+                self._worker_api.outcome(
+                    claim,
+                    outcome,
+                    _outcome_key(claim, outcome),
+                    pending_approval=pending_approval,
+                )
             return True
         except LeaseLostError:
             return False
@@ -330,7 +365,6 @@ class WorkerLoop:
 
     def _report_failure(
         self,
-        event: CodingJobRequested,
         claim: WorkerClaim,
         retryable: bool,
         code: str,
@@ -339,11 +373,7 @@ class WorkerLoop:
             self._heartbeat.ensure_current(claim)
         except LeaseLostError:
             return False
-        outcome = (
-            "RETRYABLE_FAILURE"
-            if retryable and event.attempt < self._max_attempts
-            else "PERMANENT_FAILURE"
-        )
+        outcome = "RETRYABLE_FAILURE" if retryable else "PERMANENT_FAILURE"
         try:
             self._worker_api.outcome(
                 claim,
@@ -356,6 +386,87 @@ class WorkerLoop:
             return False
 
 
+class NaturalCmsWorkerLoop:
+    """Consume the dedicated CMS lane without Coding Worker claim authority."""
+
+    def __init__(
+        self,
+        queue: ValkeyJobQueue,
+        runner: NaturalCmsSnapshotRunner,
+        health: HealthState,
+        *,
+        queue_block_seconds: int,
+        max_backoff_seconds: int,
+    ) -> None:
+        self._queue = queue
+        self._runner = runner
+        self._health = health
+        self._queue_block_seconds = queue_block_seconds
+        self._max_backoff_seconds = max_backoff_seconds
+        self._stop = threading.Event()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def run(self) -> None:
+        self._health.update(worker=True)
+        while not self._stop.is_set():
+            try:
+                delivery = self._queue.pop(self._queue_block_seconds)
+                self._health.update(queue=True)
+            except QueueError:
+                self._health.update(
+                    queue=False,
+                    last_error_code="QUEUE_UNAVAILABLE",
+                )
+                self._stop.wait(min(2, self._queue_block_seconds))
+                try:
+                    self._queue.recover_stale()
+                    self._health.update(queue=True)
+                except QueueError:
+                    pass
+                continue
+            if delivery is None:
+                continue
+            acknowledged = self.process(delivery.job)
+            try:
+                if acknowledged:
+                    self._queue.ack(delivery)
+                else:
+                    self._queue.requeue(delivery)
+                    self._stop.wait(min(2, self._max_backoff_seconds))
+            except QueueError:
+                self._health.update(
+                    queue=False,
+                    last_error_code="QUEUE_UNAVAILABLE",
+                )
+                self._stop.wait(min(2, self._queue_block_seconds))
+                try:
+                    self._queue.recover_stale()
+                    self._health.update(queue=True)
+                except QueueError:
+                    pass
+
+    def process(self, job: QueuedJobReference) -> bool:
+        try:
+            result = self._runner.invoke(job)
+            if not isinstance(result, Mapping) or result.get("status") not in {
+                "WAITING_APPROVAL",
+                "COMPLETED",
+            }:
+                raise GraphExecutionError(
+                    "CONTRACT_VALIDATION_FAILED",
+                    "The Natural CMS Snapshot returned an invalid terminal outcome.",
+                    retryable=False,
+                )
+            self._health.update(last_error_code=None)
+            return True
+        except Exception as failure:
+            retryable, code = _classify_failure(failure)
+            self._health.update(last_error_code=code)
+            return _is_terminal_natural_cms_failure(failure, retryable)
+
+
 def _classify_failure(failure: Exception) -> tuple[bool, str]:
     if isinstance(
         failure,
@@ -365,6 +476,8 @@ def _classify_failure(failure: Exception) -> tuple[bool, str]:
             ToolGatewayError,
             WorkerApiError,
             LeaseLostError,
+            NaturalCmsDomainClientError,
+            ProfileVersionClientError,
         ),
     ):
         code = getattr(failure, "code", "INTERNAL_TRANSIENT_ERROR")
@@ -378,6 +491,23 @@ def _is_terminal_resolve_rejection(failure: WorkerApiError) -> bool:
         (404, "JOB_NOT_FOUND"),
         (409, "JOB_STATE_VERSION_CONFLICT"),
     }
+
+
+def _is_terminal_natural_cms_failure(
+    failure: Exception,
+    retryable: bool,
+) -> bool:
+    if retryable:
+        return False
+    if isinstance(failure, NaturalCmsDomainClientError):
+        return (
+            failure.status is not None and 400 <= failure.status <= 499
+        ) or failure.code == "WORKER_RESPONSE_INVALID"
+    if isinstance(failure, ProfileVersionClientError):
+        return (
+            failure.status is not None and 400 <= failure.status <= 499
+        ) or failure.code == "PROFILE_VERSION_RESPONSE_INVALID"
+    return isinstance(failure, GraphExecutionError)
 
 
 def _outcome_key(claim: WorkerClaim, outcome: str) -> str:
@@ -394,9 +524,13 @@ def main() -> None:
     health = HealthState()
     server: HealthServer | None = None
     checkpoint: CheckpointRuntime | None = None
-    queue: ValkeyJobQueue | None = None
+    coding_queue: ValkeyJobQueue | None = None
+    natural_cms_queue: ValkeyJobQueue | None = None
     heartbeat: LeaseHeartbeatManager | None = None
-    loop: WorkerLoop | None = None
+    coding_loop: WorkerLoop | None = None
+    natural_cms_loop: NaturalCmsWorkerLoop | None = None
+    worker_threads: list[threading.Thread] = []
+    shutdown = threading.Event()
     try:
         settings = RuntimeSettings.from_environment()
         server = HealthServer(settings.health_host, settings.health_port, health)
@@ -405,23 +539,28 @@ def main() -> None:
             settings.checkpoint_dsn(), settings.checkpoint_encryption_key()
         ).open()
         health.update(checkpoint=checkpoint.healthy())
-        queue = ValkeyJobQueue(
+        valkey_password = settings.valkey_password()
+        coding_queue = ValkeyJobQueue(
             settings.valkey_host,
             settings.valkey_port,
             settings.valkey_database,
-            password=settings.valkey_password(),
+            password=valkey_password,
             queue_key=settings.queue_key,
         ).open()
-        health.update(queue=queue.healthy())
+        natural_cms_queue = ValkeyJobQueue(
+            settings.valkey_host,
+            settings.valkey_port,
+            settings.valkey_database,
+            password=valkey_password,
+            queue_key=settings.natural_cms_queue_key,
+        ).open()
+        health.update(
+            queue=coding_queue.healthy() and natural_cms_queue.healthy()
+        )
         credential_resolver = FileServiceCredentialResolver(
             settings.spring_credential_file
         )
         worker_api = WorkerApiClient(settings.spring_origin, credential_resolver)
-        health.bind_dependency_probes(
-            checkpoint=checkpoint.healthy,
-            queue=queue.healthy,
-            spring=worker_api.healthy,
-        )
         heartbeat = LeaseHeartbeatManager(
             worker_api, settings.heartbeat_seconds
         )
@@ -447,7 +586,7 @@ def main() -> None:
             settings.spring_origin,
             credential_resolver,
         )
-        production_registry = register_coding_node_handlers(
+        coding_registry = register_coding_node_handlers(
             build_common_node_registry(),
             CodingHandlerDependencies(
                 domain_client=coding_domain_client,
@@ -458,8 +597,8 @@ def main() -> None:
             settings.spring_origin,
             credential_resolver,
         )
-        register_natural_cms_node_handlers(
-            production_registry,
+        natural_cms_registry = register_natural_cms_node_handlers(
+            build_common_node_registry(),
             NaturalCmsHandlerDependencies(
                 domain_client=natural_cms_domain_client,
                 executor=SpringGatewayNaturalCmsStageExecutor(
@@ -467,16 +606,18 @@ def main() -> None:
                 ),
             ),
         )
+        profile_versions = ProfileVersionClient(
+            settings.spring_origin,
+            credential_resolver,
+        )
         snapshot_graph = SnapshotGraphRunner(
-            SpringSnapshotExecutionProvider(
-                ProfileVersionClient(settings.spring_origin, credential_resolver)
-            ),
-            production_registry,
+            SpringSnapshotExecutionProvider(profile_versions),
+            coding_registry,
             checkpoint.checkpointer,
         )
         graph = ProfileBoundWorkerGraphRouter(legacy_graph, snapshot_graph)
-        loop = WorkerLoop(
-            queue,
+        coding_loop = WorkerLoop(
+            coding_queue,
             worker_api,
             graph,
             heartbeat,
@@ -485,23 +626,86 @@ def main() -> None:
             max_attempts=settings.max_attempts,
             max_backoff_seconds=settings.max_backoff_seconds,
         )
+        natural_cms_loop = NaturalCmsWorkerLoop(
+            natural_cms_queue,
+            NaturalCmsSnapshotRunner(
+                natural_cms_domain_client,
+                profile_versions,
+                natural_cms_registry,
+                checkpoint.checkpointer,
+            ),
+            health,
+            queue_block_seconds=settings.queue_block_seconds,
+            max_backoff_seconds=settings.max_backoff_seconds,
+        )
+        worker_threads = [
+            threading.Thread(
+                target=coding_loop.run,
+                name="axms-coding-worker",
+            ),
+            threading.Thread(
+                target=natural_cms_loop.run,
+                name="axms-natural-cms-worker",
+            ),
+        ]
+        health.bind_dependency_probes(
+            checkpoint=checkpoint.healthy,
+            queue=lambda: (
+                coding_queue is not None
+                and natural_cms_queue is not None
+                and coding_queue.healthy()
+                and natural_cms_queue.healthy()
+            ),
+            spring=worker_api.healthy,
+            worker=lambda: len(worker_threads) == 2
+            and all(thread.is_alive() for thread in worker_threads),
+        )
 
         def stop_handler(_signal: int, _frame: object) -> None:
-            if loop is not None:
-                loop.stop()
+            shutdown.set()
+            if coding_loop is not None:
+                coding_loop.stop()
+            if natural_cms_loop is not None:
+                natural_cms_loop.stop()
 
         signal.signal(signal.SIGTERM, stop_handler)
         signal.signal(signal.SIGINT, stop_handler)
-        loop.run()
+        for thread in worker_threads:
+            thread.start()
+        while not shutdown.wait(0.5) and all(
+            thread.is_alive() for thread in worker_threads
+        ):
+            pass
+        unexpected_stop = not shutdown.is_set()
+        coding_loop.stop()
+        natural_cms_loop.stop()
+        for thread in worker_threads:
+            thread.join(timeout=15)
+        if unexpected_stop or any(thread.is_alive() for thread in worker_threads):
+            health.update(
+                live=False,
+                worker=False,
+                last_error_code="WORKER_STOPPED",
+            )
+            raise RuntimeError("worker loop stopped unexpectedly")
     except (ConfigurationError, CheckpointError, QueueError):
         health.update(live=False, worker=False, last_error_code="STARTUP_FAILED")
         raise SystemExit(1) from None
     finally:
         health.update(worker=False)
+        if coding_loop is not None:
+            coding_loop.stop()
+        if natural_cms_loop is not None:
+            natural_cms_loop.stop()
+        for thread in worker_threads:
+            if thread.is_alive():
+                thread.join(timeout=15)
         if heartbeat is not None:
             heartbeat.close()
-        if queue is not None:
-            queue.close()
+        if natural_cms_queue is not None:
+            natural_cms_queue.close()
+        if coding_queue is not None:
+            coding_queue.close()
         if checkpoint is not None:
             checkpoint.close()
         if server is not None:

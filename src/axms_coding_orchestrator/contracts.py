@@ -404,12 +404,24 @@ def validate_lease_response(
 
 
 def validate_outcome_receipt(
-    value: Mapping[str, Any], claim: WorkerClaim, outcome: str
+    value: Mapping[str, Any],
+    claim: WorkerClaim,
+    outcome: str,
+    *,
+    pending_approval: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload = _object(value, "outcomeReceipt")
+    waiting = outcome == "WAITING_APPROVAL"
+    if waiting != isinstance(pending_approval, Mapping):
+        raise WorkerContractViolation(
+            "outcome receipt approval authority is invalid"
+        )
+    fields = {"schemaVersion", "jobId", "traceId", "stateVersion", "status"}
+    if waiting:
+        fields.add("pendingApproval")
     _exact_fields(
         payload,
-        {"schemaVersion", "jobId", "traceId", "stateVersion", "status"},
+        fields,
         "outcomeReceipt",
     )
     _schema_version(payload["schemaVersion"])
@@ -430,6 +442,12 @@ def validate_outcome_receipt(
     }.get(outcome)
     if payload["status"] != expected_status:
         raise WorkerContractViolation("outcome receipt status is invalid")
+    if waiting:
+        received = _object(payload["pendingApproval"], "pendingApproval")
+        if received != dict(pending_approval or {}):
+            raise WorkerContractViolation(
+                "outcome receipt approval authority is invalid"
+            )
     return deepcopy(payload)
 
 

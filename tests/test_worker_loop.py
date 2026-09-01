@@ -15,6 +15,21 @@ from axms_coding_orchestrator.worker_api import WorkerApiError
 from factories import FIXED_NOW, coding_event, worker_claim
 
 
+PENDING_APPROVAL = {
+    "schemaVersion": "1.0",
+    "approvalId": "61616161-6161-4161-8161-616161616161",
+    "jobId": "20202020-2020-4020-8020-202020202020",
+    "profileVersionId": "11111111-1111-4111-8111-111111111111",
+    "nodeId": "scope_approval",
+    "stage": "SCOPE",
+    "stageRound": 1,
+    "requiredRole": "GENERAL_ADMIN",
+    "pipelineAttempt": 1,
+    "traceId": "30303030-3030-4030-8030-303030303030",
+    "stateVersion": 5,
+}
+
+
 class _UnusedQueue:
     pass
 
@@ -79,8 +94,18 @@ class _WorkerApi:
             )
         return self.authoritative_claim
 
-    def outcome(self, claim, outcome, idempotency_key, *, error_code=None):
-        self.outcomes.append((outcome, idempotency_key, error_code))
+    def outcome(
+        self,
+        claim,
+        outcome,
+        idempotency_key,
+        *,
+        error_code=None,
+        pending_approval=None,
+    ):
+        self.outcomes.append(
+            (outcome, idempotency_key, error_code, pending_approval)
+        )
         return {}
 
 
@@ -101,11 +126,20 @@ class _Heartbeat:
 
 class _Graph:
     def __init__(
-        self, *, duplicate: bool = False, failure=None, duplicate_failure=None
+        self,
+        *,
+        duplicate: bool = False,
+        failure=None,
+        duplicate_failure=None,
+        result=None,
     ) -> None:
         self.duplicate = duplicate
         self.failure = failure
         self.duplicate_failure = duplicate_failure
+        self.result = result or {
+            "status": "WAITING_APPROVAL",
+            "pendingApproval": dict(PENDING_APPROVAL),
+        }
         self.invocations = 0
 
     def is_duplicate(self, event):
@@ -117,7 +151,7 @@ class _Graph:
         self.invocations += 1
         if self.failure is not None:
             raise self.failure
-        return {"status": "WAITING_APPROVAL"}
+        return self.result
 
 
 class WorkerLoopTest(unittest.TestCase):
@@ -176,25 +210,48 @@ class WorkerLoopTest(unittest.TestCase):
         self.assertEqual([event.job_id], heartbeat.stopped)
         self.assertEqual("WAITING_APPROVAL", worker.outcomes[0][0])
 
-    def test_retryable_graph_failure_reports_retry_or_permanent_by_attempt(self) -> None:
+    def test_waiting_snapshot_outcome_forwards_pending_approval(self) -> None:
+        graph = _Graph(
+            result={
+                "status": "WAITING_APPROVAL",
+                "pendingApproval": dict(PENDING_APPROVAL),
+            }
+        )
+        event, worker, _, _, loop = self.build(graph=graph)
+
+        self.assertTrue(loop.process(self.job(event)))
+
+        self.assertEqual("WAITING_APPROVAL", worker.outcomes[0][0])
+        self.assertEqual(PENDING_APPROVAL, worker.outcomes[0][3])
+
+    def test_retryable_graph_failure_is_never_exhausted_by_transport_attempts(self) -> None:
         failure = GraphExecutionError(
             "TOOL_EXECUTOR_UNAVAILABLE", "safe failure", retryable=True
         )
-        graph = _Graph(failure=failure)
-        event, worker, _, _, loop = self.build(graph=graph)
-        self.assertTrue(loop.process(self.job(event)))
-        self.assertEqual("RETRYABLE_FAILURE", worker.outcomes[0][0])
-        self.assertEqual("TOOL_EXECUTOR_UNAVAILABLE", worker.outcomes[0][2])
+        cases = (
+            (1, 3, "13131313-1313-4313-8313-131313131311"),
+            (3, 3, "13131313-1313-4313-8313-131313131312"),
+            (3, 1, "13131313-1313-4313-8313-131313131313"),
+        )
+        for execution_attempt, transport_attempts, event_id in cases:
+            with self.subTest(
+                execution_attempt=execution_attempt,
+                transport_attempts=transport_attempts,
+            ):
+                graph = _Graph(failure=failure)
+                event, worker, _, _, loop = self.build(
+                    coding_event(event_id=event_id, attempt=execution_attempt),
+                    graph=graph,
+                    max_attempts=transport_attempts,
+                )
 
-        final_payload = coding_event(
-            event_id="13131313-1313-4313-8313-131313131313", attempt=3
-        )
-        final_graph = _Graph(failure=failure)
-        final_event, final_worker, _, _, final_loop = self.build(
-            final_payload, graph=final_graph
-        )
-        self.assertTrue(final_loop.process(self.job(final_event)))
-        self.assertEqual("PERMANENT_FAILURE", final_worker.outcomes[0][0])
+                self.assertTrue(event.is_profile_bound)
+                self.assertTrue(loop.process(self.job(event)))
+
+                self.assertEqual("RETRYABLE_FAILURE", worker.outcomes[0][0])
+                self.assertEqual(
+                    "TOOL_EXECUTOR_UNAVAILABLE", worker.outcomes[0][2]
+                )
 
     def test_legacy_checkpoint_duplicate_is_discarded_before_claim(self) -> None:
         event, claim = self.legacy_event_and_claim()

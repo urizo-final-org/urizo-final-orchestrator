@@ -580,6 +580,7 @@ class CodingApprovalHandlerTest(unittest.TestCase):
         self.assertEqual("approved", result.port)
         self.assertEqual(approval_id, interrupt_payloads[0]["approvalId"])
         self.assertEqual("SCOPE", interrupt_payloads[0]["stage"])
+        self.assertEqual(1, interrupt_payloads[0]["stageRound"])
         self.assertEqual("GENERAL_ADMIN", interrupt_payloads[0]["requiredRole"])
 
     def test_super_admin_stage_rejects_general_admin_decision(self) -> None:
@@ -616,30 +617,76 @@ class CodingApprovalHandlerTest(unittest.TestCase):
 
         self.assertEqual("JOB_STATE_VERSION_CONFLICT", raised.exception.code)
 
-    def test_snapshot_stage_role_matrix_is_exact(self) -> None:
-        cases = (
-            ("coding.approval", "scope_approval", "SCOPE", "SUPER_ADMIN"),
-            (
-                "coding.preview_approval",
-                "preview_approval",
-                "CANDIDATE",
-                "SUPER_ADMIN",
-            ),
-            ("coding.approval", "github_approval", "GITHUB", "GENERAL_ADMIN"),
-            ("coding.approval", "cms_approval", "CMS", "SUPER_ADMIN"),
-            ("coding.approval", "deploy_approval", "DEPLOY", "GENERAL_ADMIN"),
+    def test_snapshot_required_role_is_authority_for_every_stage(self) -> None:
+        stages = (
+            ("coding.approval", "scope_approval", "SCOPE"),
+            ("coding.preview_approval", "preview_approval", "CANDIDATE"),
+            ("coding.approval", "github_approval", "GITHUB"),
+            ("coding.approval", "cms_approval", "CMS"),
+            ("coding.approval", "deploy_approval", "DEPLOY"),
         )
-        for handler_key, node_id, stage, required_role in cases:
-            with self.subTest(stage=stage):
-                handler = self._handler(handler_key, _aggregate())
-                with self.assertRaises(GraphExecutionError) as raised:
-                    handler(  # type: ignore[operator]
-                        _invocation(
-                            node_id,
-                            config={"stage": stage, "requiredRole": required_role},
+        role_cases = (
+            ("GENERAL_ADMIN", "GENERAL_ADMIN", True),
+            ("GENERAL_ADMIN", "SUPER_ADMIN", True),
+            ("SUPER_ADMIN", "SUPER_ADMIN", True),
+            ("SUPER_ADMIN", "GENERAL_ADMIN", False),
+        )
+        source = _subject_aggregate()
+        for handler_key, node_id, stage in stages:
+            for required_role, actor_role, accepted in role_cases:
+                decision = CodingApprovalDecision(
+                    approval_id=_approval_id(
+                        pipeline_attempt=1,
+                        node_id=node_id,
+                        stage=stage,
+                        stage_round=1,
+                    ),
+                    node_id=node_id,
+                    stage=stage,
+                    stage_round=1,
+                    decision="APPROVED",
+                    candidate_sha=SHA,
+                    validation_hash=DIGEST,
+                    feedback=None,
+                    actor_id=ACTOR_ID,
+                    actor_role=actor_role,
+                    result_state_version=7,
+                    next_pipeline_attempt=None,
+                    decided_at=NOW,
+                )
+                prior = tuple(
+                    item for item in source.decisions if item.stage != stage
+                )
+                aggregate = _aggregate(
+                    results=source.results,
+                    decisions=(*prior, decision),
+                )
+                handler = self._handler(handler_key, aggregate)
+                invocation = _invocation(
+                    node_id,
+                    config={"stage": stage, "requiredRole": required_role},
+                )
+
+                with self.subTest(
+                    stage=stage,
+                    required_role=required_role,
+                    actor_role=actor_role,
+                ), patch(
+                    "axms_coding_orchestrator.coding_handlers.interrupt",
+                    return_value=True,
+                ):
+                    if accepted:
+                        self.assertEqual(
+                            "approved",
+                            handler(invocation).port,  # type: ignore[operator]
                         )
-                    )
-                self.assertEqual("CONTRACT_VALIDATION_FAILED", raised.exception.code)
+                    else:
+                        with self.assertRaises(GraphExecutionError) as raised:
+                            handler(invocation)  # type: ignore[operator]
+                        self.assertEqual(
+                            "JOB_STATE_VERSION_CONFLICT",
+                            raised.exception.code,
+                        )
 
     def test_github_approval_requires_prior_candidate_approval_for_same_subject(
         self,

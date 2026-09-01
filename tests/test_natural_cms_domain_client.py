@@ -4,8 +4,10 @@ import json
 import unittest
 from unittest.mock import patch
 
+from axms_coding_orchestrator.contracts import QueuedJobReference
 from axms_coding_orchestrator.model_gateway import ServiceCredentialLease
 from axms_coding_orchestrator.natural_cms_domain_client import (
+    NaturalCmsJob,
     NaturalCmsStageResult,
     SpringNaturalCmsDomainClient,
 )
@@ -19,6 +21,67 @@ RESULT_ID = "44444444-4444-4444-8444-444444444444"
 
 
 class SpringNaturalCmsDomainClientTest(unittest.TestCase):
+    def test_resolve_job_uses_the_job_id_only_spring_boundary(self) -> None:
+        response = {
+            "schemaVersion": "1.0",
+            "jobId": JOB_ID,
+            "traceId": TRACE_ID,
+            "profileVersionId": PROFILE_VERSION_ID,
+            "pipelineAttempt": 2,
+            "stateVersion": 7,
+            "status": "WAITING_APPROVAL",
+            "requestText": "Update content 7",
+            "resource": {"type": "CONTENT", "id": "7"},
+            "structuredCommand": {"operation": "UPDATE"},
+            "previewId": "55555555-5555-4555-8555-555555555555",
+            "previewHash": "sha256:" + ("a" * 64),
+            "previewValid": True,
+            "approvalDecision": "APPROVED",
+            "approvalFeedback": None,
+            "createdAt": "2026-09-01T00:00:00Z",
+            "updatedAt": "2026-09-01T00:01:00Z",
+        }
+        observed: dict[str, object] = {}
+
+        def request_http(
+            method: str,
+            url: str,
+            body: bytes | None,
+            credential: bytearray,
+            timeout_seconds: float,
+        ) -> tuple[int, bytes]:
+            observed.update(
+                method=method,
+                url=url,
+                body=body,
+                credential=bytes(credential),
+                timeout=timeout_seconds,
+            )
+            return 200, json.dumps(response).encode("utf-8")
+
+        client = SpringNaturalCmsDomainClient(
+            "http://127.0.0.1:18080",
+            lambda: ServiceCredentialLease(b"spring-service-test-token"),
+            allowed_origins={"http://127.0.0.1:18080"},
+        )
+        reference = QueuedJobReference.from_dict({"jobId": JOB_ID})
+        with patch(
+            "axms_coding_orchestrator.natural_cms_domain_client._request_http",
+            side_effect=request_http,
+        ):
+            job = client.resolve_job(reference)
+
+        self.assertIsInstance(job, NaturalCmsJob)
+        self.assertEqual(JOB_ID, job.job_id)
+        self.assertEqual("Update content 7", job.request_text)
+        self.assertEqual("GET", observed["method"])
+        self.assertEqual(
+            f"http://127.0.0.1:18080/internal/natural-cms/jobs/{JOB_ID}",
+            observed["url"],
+        )
+        self.assertIsNone(observed["body"])
+        self.assertEqual(b"spring-service-test-token", observed["credential"])
+
     def test_execute_stage_passes_the_frozen_profile_and_current_node(self) -> None:
         invocation = NodeInvocation.create(
             job_id=JOB_ID,

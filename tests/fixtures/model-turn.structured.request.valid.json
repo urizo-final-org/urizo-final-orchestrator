@@ -1,0 +1,33 @@
+{
+  "schemaVersion": "1.0",
+  "turnId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab",
+  "jobId": "55555555-5555-4555-8555-555555555555",
+  "traceId": "66666666-6666-4666-8666-666666666666",
+  "idempotencyKey": "stage0.model.structured.0001",
+  "attempt": 1,
+  "expectedStateVersion": 5,
+  "nodeName": "summarize",
+  "promptVersion": "coding-summary-v1",
+  "contextDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "requiredCapabilities": ["CHAT", "STRUCTURED_OUTPUT"],
+  "messages": [
+    {
+      "role": "user",
+      "content": "Return the bounded review summary."
+    }
+  ],
+  "toolSchemas": [],
+  "responseFormat": {
+    "type": "JSON_SCHEMA",
+    "schemaDigest": "sha256:35de5b90eb8853f6f4ad33341674e3b0e7231c1d16d438cb52994be484c47d69",
+    "outputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["summary"],
+      "properties": {
+        "summary": { "type": "string" }
+      }
+    }
+  },
+  "deadlineAt": "2026-08-10T09:14:00Z"
+}

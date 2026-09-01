@@ -43,7 +43,17 @@ class RuntimeSettingsTest(unittest.TestCase):
 
         self.assertEqual(bytes(range(32)), settings.checkpoint_encryption_key())
         self.assertEqual("test-valkey-password", settings.valkey_password())
+        self.assertEqual(
+            "axms:natural-cms:jobs:v1", settings.natural_cms_queue_key
+        )
         self.assertIn("checkpoint_database:5432/axms_langgraph", settings.checkpoint_dsn())
+
+    def test_natural_cms_queue_lane_is_fixed_and_distinct(self) -> None:
+        environment = self.environment()
+        environment["AXMS_NATURAL_CMS_QUEUE_KEY"] = "axms:coding:jobs:v1"
+
+        with self.assertRaisesRegex(ConfigurationError, "Natural CMS queue"):
+            RuntimeSettings.from_environment(environment)
 
     def test_provider_or_core_database_authority_is_rejected(self) -> None:
         for forbidden in ("OPENAI_API_KEY", "AXMS_CORE_DB_PASSWORD_FILE"):

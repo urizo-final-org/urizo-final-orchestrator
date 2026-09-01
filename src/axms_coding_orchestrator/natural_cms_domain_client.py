@@ -11,12 +11,13 @@ from typing import Any, Mapping, Protocol
 from uuid import UUID
 
 from .coding_domain_client import _canonical_origin, _request_coding_http
-from .contracts import SHA256_DIGEST, canonical_json_bytes
+from .contracts import QueuedJobReference, SHA256_DIGEST, canonical_json_bytes
 from .model_gateway import (
     ContractViolation,
     CredentialResolver,
     ModelGatewayRemoteError,
     SPRING_PRIVATE_ORIGIN,
+    _request_http,
 )
 from .node_runtime import NodeInvocation
 from .snapshot import HANDLER_KEY
@@ -32,10 +33,18 @@ SAFE_ERROR_CODE = re.compile(r"^[A-Z][A-Z0-9_]{2,119}$")
 
 
 class NaturalCmsDomainClientError(RuntimeError):
-    def __init__(self, code: str, message: str, *, retryable: bool) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        retryable: bool,
+        status: int | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.retryable = retryable
+        self.status = status
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +76,7 @@ class NaturalCmsJob:
     preview_hash: str | None
     preview_valid: bool
     approval_decision: str | None
+    request_text: str
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "NaturalCmsJob":
@@ -88,6 +98,12 @@ class NaturalCmsJob:
         preview_id = data.get("previewId")
         preview_hash = data.get("previewHash")
         decision = data.get("approvalDecision")
+        request_text = data.get("requestText")
+        if (
+            not isinstance(request_text, str)
+            or not 1 <= len(request_text) <= 10_000
+        ):
+            raise ValueError("job.requestText is invalid")
         if preview_id is not None:
             preview_id = _uuid(preview_id, "job.previewId")
         if preview_hash is not None and (
@@ -110,6 +126,7 @@ class NaturalCmsJob:
             preview_hash,
             _boolean(data["previewValid"], "job.previewValid"),
             decision,
+            request_text,
         )
 
 
@@ -168,6 +185,8 @@ class NaturalCmsStageResult:
 
 
 class NaturalCmsDomainClient(Protocol):
+    def resolve_job(self, job: QueuedJobReference) -> NaturalCmsJob: ...
+
     def get_job(self, invocation: NodeInvocation) -> NaturalCmsJob: ...
 
     def execute_stage(
@@ -203,6 +222,23 @@ class SpringNaturalCmsDomainClient:
         self._origin = spring_origin
         self._credential_resolver = credential_resolver
         self._timeout_seconds = float(timeout_seconds)
+
+    def resolve_job(self, job: QueuedJobReference) -> NaturalCmsJob:
+        if not isinstance(job, QueuedJobReference):
+            raise TypeError("job must be a QueuedJobReference")
+        response = self._call(
+            "GET",
+            f"/internal/natural-cms/jobs/{job.job_id}",
+            None,
+            None,
+        )
+        try:
+            resolved = NaturalCmsJob.from_dict(response)
+        except (TypeError, ValueError, RecursionError):
+            raise _invalid_response() from None
+        if resolved.job_id != job.job_id:
+            raise _invalid_response()
+        return resolved
 
     def get_job(self, invocation: NodeInvocation) -> NaturalCmsJob:
         response = self._call(
@@ -254,7 +290,7 @@ class SpringNaturalCmsDomainClient:
         method: str,
         path: str,
         body: bytes | None,
-        invocation: NodeInvocation,
+        invocation: NodeInvocation | None,
     ) -> Mapping[str, Any]:
         credential = bytearray()
         try:
@@ -268,14 +304,23 @@ class SpringNaturalCmsDomainClient:
                     retryable=False,
                 ) from None
             try:
-                status, raw = _request_coding_http(
-                    method,
-                    self._origin + path,
-                    body,
-                    credential,
-                    self._timeout_seconds,
-                    invocation.trace_id,
-                )
+                if invocation is None:
+                    status, raw = _request_http(
+                        method,
+                        self._origin + path,
+                        body,
+                        credential,
+                        self._timeout_seconds,
+                    )
+                else:
+                    status, raw = _request_coding_http(
+                        method,
+                        self._origin + path,
+                        body,
+                        credential,
+                        self._timeout_seconds,
+                        invocation.trace_id,
+                    )
             except (TimeoutError, socket.timeout, OSError):
                 raise NaturalCmsDomainClientError(
                     "INTERNAL_TRANSIENT_ERROR",
@@ -325,7 +370,10 @@ def _remote_error(status: int, raw: bytes) -> NaturalCmsDomainClientError:
         ):
             raise ValueError
         return NaturalCmsDomainClientError(
-            code, "Spring Natural CMS request was rejected.", retryable=retryable
+            code,
+            "Spring Natural CMS request was rejected.",
+            retryable=retryable,
+            status=status,
         )
     except (ValueError, TypeError, json.JSONDecodeError, UnicodeDecodeError):
         return _invalid_response()
