@@ -59,13 +59,6 @@ _EMPTY_CONFIG_HANDLERS = frozenset(
         "coding.pr_request",
     }
 )
-_STAGE_REQUIRED_ROLES = {
-    "SCOPE": "GENERAL_ADMIN",
-    "CANDIDATE": "GENERAL_ADMIN",
-    "GITHUB": "SUPER_ADMIN",
-    "CMS": "GENERAL_ADMIN",
-    "DEPLOY": "SUPER_ADMIN",
-}
 
 
 class CodingHandlerFailure(RuntimeError):
@@ -391,7 +384,6 @@ def _approval_handler(
             or stage not in APPROVAL_STAGES
             or not isinstance(required_role, str)
             or required_role not in APPROVAL_ROLES
-            or _STAGE_REQUIRED_ROLES.get(stage) != required_role
             or (expected_stage is not None) != (stage == "CANDIDATE")
         ):
             raise _contract_failure("coding approval config is invalid")
@@ -405,6 +397,7 @@ def _approval_handler(
                 "profileVersionId": invocation.profile_version_id,
                 "nodeId": invocation.node_id,
                 "stage": stage,
+                "stageRound": round_number,
                 "requiredRole": required_role,
                 "pipelineAttempt": invocation.pipeline_attempt,
                 "traceId": invocation.trace_id,
@@ -527,10 +520,6 @@ def _validate_post_preview_decision(
             or (requests[-1].candidate_sha, requests[-1].validation_hash) != subject
         ):
             raise ValueError("GitHub approval is not bound to the PR request")
-    prior_stage = {"CMS": "GITHUB", "DEPLOY": "CMS"}.get(decision.stage)
-    if prior_stage is not None:
-        prior = _require_approved_decision(aggregate, prior_stage, subject)
-        _validate_post_preview_decision(aggregate, prior)
 
 
 def _stage_required_subject(

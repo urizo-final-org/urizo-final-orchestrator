@@ -64,6 +64,7 @@ class _Domain:
             self.preview_hash,
             self.preview_valid,
             self.decision,
+            "Update content 7",
         )
 
     def decide(self, decision: str) -> int:

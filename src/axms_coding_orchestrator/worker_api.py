@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, timezone
 import json
 import re
@@ -154,6 +155,7 @@ class WorkerApiClient:
         idempotency_key: str,
         *,
         error_code: str | None = None,
+        pending_approval: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         if outcome not in OUTCOMES:
             raise ValueError("outcome is invalid")
@@ -162,6 +164,16 @@ class WorkerApiClient:
             raise ValueError("error_code must be present only for failure outcomes")
         if error_code is not None and not SAFE_ERROR_CODE.fullmatch(error_code):
             raise ValueError("error_code is invalid")
+        waiting = outcome == "WAITING_APPROVAL"
+        if waiting != isinstance(pending_approval, Mapping):
+            raise ValueError(
+                "pending_approval must be present only for a waiting outcome"
+            )
+        if pending_approval is not None:
+            pending_approval = _validated_pending_approval(
+                pending_approval,
+                claim,
+            )
         body = {
             "schemaVersion": "1.0",
             "jobId": claim.job_id,
@@ -172,6 +184,8 @@ class WorkerApiClient:
             "outcome": outcome,
             "errorCode": error_code,
         }
+        if pending_approval is not None:
+            body["pendingApproval"] = pending_approval
         response = self._call(
             "POST",
             f"/internal/coding/worker/jobs/{claim.job_id}/outcomes",
@@ -179,7 +193,12 @@ class WorkerApiClient:
             error_context=body,
         )
         try:
-            return validate_outcome_receipt(response, claim, outcome)
+            return validate_outcome_receipt(
+                response,
+                claim,
+                outcome,
+                pending_approval=pending_approval,
+            )
         except WorkerContractViolation:
             raise WorkerApiError(
                 "WORKER_RESPONSE_INVALID",
@@ -277,6 +296,72 @@ class WorkerApiClient:
                 retryable=False,
             )
         return value
+
+
+def _validated_pending_approval(
+    value: Mapping[str, Any],
+    claim: WorkerClaim,
+) -> dict[str, Any]:
+    if not all(isinstance(key, str) for key in value):
+        raise ValueError("pending_approval is invalid")
+    payload = dict(value)
+    expected_fields = {
+        "schemaVersion",
+        "approvalId",
+        "jobId",
+        "profileVersionId",
+        "nodeId",
+        "stage",
+        "stageRound",
+        "requiredRole",
+        "pipelineAttempt",
+        "traceId",
+        "stateVersion",
+    }
+    if (
+        set(payload) != expected_fields
+        or payload["schemaVersion"] != "1.0"
+        or payload["jobId"] != claim.job_id
+        or payload["profileVersionId"] != claim.profile_version_id
+        or payload["traceId"] != claim.trace_id
+        or payload["stateVersion"] != claim.state_version
+        or not isinstance(payload["nodeId"], str)
+        or not 1 <= len(payload["nodeId"]) <= 64
+    ):
+        raise ValueError("pending_approval is invalid")
+    for field in ("stateVersion", "pipelineAttempt", "stageRound"):
+        if (
+            isinstance(payload[field], bool)
+            or not isinstance(payload[field], int)
+            or payload[field] < 1
+        ):
+            raise ValueError("pending_approval is invalid")
+    for field in ("stage", "requiredRole"):
+        if (
+            not isinstance(payload[field], str)
+            or not 1 <= len(payload[field]) <= 64
+        ):
+            raise ValueError("pending_approval is invalid")
+    try:
+        if (
+            not isinstance(payload["approvalId"], str)
+            or str(UUID(payload["approvalId"])) != payload["approvalId"]
+        ):
+            raise ValueError
+    except (ValueError, AttributeError):
+        raise ValueError("pending_approval is invalid") from None
+    return deepcopy(
+        {
+            field: payload[field]
+            for field in (
+                "approvalId",
+                "nodeId",
+                "stage",
+                "stageRound",
+                "requiredRole",
+            )
+        }
+    )
 
 
 def _safe_remote_error(

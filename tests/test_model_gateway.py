@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
@@ -27,6 +28,17 @@ FIXED_NOW = datetime(2026, 8, 10, 9, 10, 0, tzinfo=timezone.utc)
 
 def fixture(name: str) -> dict[str, object]:
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
+
+
+def reverse_object_order(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            key: reverse_object_order(value[key])
+            for key in reversed(value)
+        }
+    if isinstance(value, list):
+        return [reverse_object_order(item) for item in value]
+    return value
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -82,6 +94,55 @@ class ModelTurnContractTest(unittest.TestCase):
 
         self.assertEqual(payload, parsed.to_dict())
         self.assertNotIn("inspect the approved", repr(parsed))
+
+    def test_multiturn_request_preserves_ordered_roles_and_declared_tool_schema(self) -> None:
+        payload = fixture("model-turn.multiturn.request.valid.json")
+
+        parsed = ModelTurnRequest.from_dict(payload).to_dict()
+
+        self.assertEqual(["user", "assistant", "tool"], [
+            message["role"] for message in parsed["messages"]
+        ])
+        self.assertEqual(payload["messages"], parsed["messages"])
+        self.assertEqual(payload["toolSchemas"], parsed["toolSchemas"])
+        self.assertEqual(
+            parsed["messages"][1]["toolCalls"][0]["toolCallId"],
+            parsed["messages"][2]["toolCallId"],
+        )
+
+    def test_structured_contract_preserves_json_schema_metadata_and_object_output(self) -> None:
+        request_payload = fixture("model-turn.structured.request.valid.json")
+        response_payload = fixture("model-turn.structured.response.valid.json")
+
+        request = ModelTurnRequest.from_dict(request_payload).to_dict()
+        response = ModelTurnResponse.from_dict(response_payload).to_dict()
+
+        self.assertEqual(["CHAT", "STRUCTURED_OUTPUT"], request["requiredCapabilities"])
+        self.assertEqual(request_payload["responseFormat"], request["responseFormat"])
+        self.assertEqual(
+            request["responseFormat"]["schemaDigest"],
+            response["responseFormat"]["schemaDigest"],
+        )
+        self.assertEqual(response_payload["responseFormat"], response["responseFormat"])
+
+        invalid = fixture("model-turn.structured.response.valid.json")
+        invalid["responseFormat"]["structuredOutput"] = []
+        with self.assertRaisesRegex(ContractViolation, "must be an object"):
+            ModelTurnResponse.from_dict(invalid)
+
+    def test_request_json_has_a_deterministic_canonical_digest(self) -> None:
+        payload = fixture("model-turn.structured.request.valid.json")
+        reordered = reverse_object_order(payload)
+        self.assertIsInstance(reordered, dict)
+
+        original = ModelTurnRequest.from_dict(payload)
+        equivalent = ModelTurnRequest.from_dict(reordered)
+
+        self.assertEqual(original.to_json(), equivalent.to_json())
+        self.assertEqual(
+            "sha256:981870bc3c131d0a35cb01380d5b7061d80f7b91c789db5192a9ada9f7083b37",
+            "sha256:" + hashlib.sha256(original.to_json()).hexdigest(),
+        )
 
     def test_unknown_request_field_and_version_are_rejected(self) -> None:
         unknown = fixture("model-turn.request.valid.json")
@@ -236,6 +297,23 @@ class ModelGatewayClientTest(unittest.TestCase):
         with gateway_server(200, response) as endpoint:
             with self.assertRaises(ModelGatewayRemoteError) as raised:
                 self.client(endpoint).execute(self.request)
+
+        self.assertEqual("MODEL_RESPONSE_INVALID", raised.exception.code)
+
+    def test_structured_response_round_trip_is_bound_to_the_declared_schema(self) -> None:
+        request_payload = fixture("model-turn.structured.request.valid.json")
+        request = ModelTurnRequest.from_dict(request_payload)
+        response = fixture("model-turn.structured.response.valid.json")
+        with gateway_server(200, response) as endpoint:
+            result = self.client(endpoint).execute(request)
+
+        self.assertEqual(request_payload, _Handler.observed_request)
+        self.assertEqual(response["responseFormat"], result.to_dict()["responseFormat"])
+
+        response["responseFormat"]["schemaDigest"] = "sha256:" + ("a" * 64)
+        with gateway_server(200, response) as endpoint:
+            with self.assertRaises(ModelGatewayRemoteError) as raised:
+                self.client(endpoint).execute(request)
 
         self.assertEqual("MODEL_RESPONSE_INVALID", raised.exception.code)
 

@@ -22,12 +22,14 @@ from axms_coding_orchestrator.common_handlers import build_common_node_registry
 from axms_coding_orchestrator.default_coding_snapshot import (
     DEFAULT_CODING_PROFILE_VERSION_ID,
     default_coding_snapshot,
+    default_coding_snapshot_dict,
 )
 from axms_coding_orchestrator.graph_builder import (
     SnapshotGraphBuilder,
     SnapshotGraphExecutionError,
 )
 from axms_coding_orchestrator.node_runtime import NodeInvocation
+from axms_coding_orchestrator.snapshot import VersionedSnapshot
 
 
 JOB_ID = "20202020-2020-4020-8020-202020202020"
@@ -313,6 +315,98 @@ class CodingHandlerGraphContractTest(unittest.TestCase):
         self.assertEqual(1, executor.counts["coding.deploy_request"])
         self.assertEqual(
             "recorded", waiting["context"]["codingLastResult"]["resultPort"]
+        )
+
+    def test_reordered_snapshot_edges_control_approval_interrupts_across_restarts(
+        self,
+    ) -> None:
+        payload = default_coding_snapshot_dict()
+        reordered_targets = {
+            ("pr_request", "requested"): "cms_approval",
+            ("cms_approval", "approved"): "github_approval",
+            ("github_approval", "approved"): "deploy_approval",
+        }
+        changed_routes: set[tuple[str, str]] = set()
+        for edge in payload["edges"]:
+            route = (edge["from"], edge["resultPort"])
+            target = reordered_targets.get(route)
+            if target is not None:
+                edge["to"] = target
+                changed_routes.add(route)
+        self.assertEqual(set(reordered_targets), changed_routes)
+        snapshot = VersionedSnapshot.from_dict(payload)
+
+        domain = _Domain()
+        executor = _ScriptedExecutor()
+        registry = register_coding_node_handlers(
+            build_common_node_registry(),
+            CodingHandlerDependencies(domain, executor),
+        )
+        checkpointer = InMemorySaver()
+        config: dict[str, object] = {
+            "configurable": {"thread_id": JOB_ID},
+            "recursion_limit": 100,
+        }
+
+        def invoke(value: object) -> dict[str, object]:
+            graph = SnapshotGraphBuilder(registry).compile(
+                snapshot, checkpointer=checkpointer
+            )
+            return graph.invoke(value, config=config)  # type: ignore[no-any-return]
+
+        def interrupted_at(result: dict[str, object]) -> tuple[str, str]:
+            interruptions = result["__interrupt__"]
+            self.assertEqual(1, len(interruptions))  # type: ignore[arg-type]
+            value = interruptions[0].value  # type: ignore[index,union-attr]
+            return value["nodeId"], value["stage"]
+
+        waiting = invoke(_state())
+        self.assertEqual(("scope_approval", "SCOPE"), interrupted_at(waiting))
+        self.assertEqual({JOB_ID}, set(checkpointer.storage))
+
+        approvals = (
+            ("scope_approval", "SCOPE", 6, "preview_approval", "CANDIDATE"),
+            ("preview_approval", "CANDIDATE", 7, "cms_approval", "CMS"),
+            ("cms_approval", "CMS", 8, "github_approval", "GITHUB"),
+            ("github_approval", "GITHUB", 9, "deploy_approval", "DEPLOY"),
+        )
+        for node_id, stage, state_version, next_node_id, next_stage in approvals:
+            domain.approve(
+                node_id=node_id,
+                stage=stage,
+                stage_round=1,
+                pipeline_attempt=1,
+                state_version=state_version,
+            )
+            waiting = invoke(
+                Command(resume=True, update={"stateVersion": state_version})
+            )
+            self.assertEqual(
+                (next_node_id, next_stage),
+                interrupted_at(waiting),
+            )
+
+        domain.approve(
+            node_id="deploy_approval",
+            stage="DEPLOY",
+            stage_round=1,
+            pipeline_attempt=1,
+            state_version=10,
+        )
+        completed = invoke(Command(resume=True, update={"stateVersion": 10}))
+
+        self.assertNotIn("__interrupt__", completed)
+        self.assertEqual("end", completed["_snapshotLastNodeId"])
+        self.assertEqual(
+            {
+                "coding.analyze": 1,
+                "coding.code": 1,
+                "coding.review": 1,
+                "coding.preview": 1,
+                "coding.pr_request": 1,
+                "coding.deploy_request": 1,
+            },
+            {handler: executor.counts[handler] for handler in executor.counts},
         )
 
     def test_candidate_rejection_resumes_new_attempt_and_routes_back_to_analyze(self) -> None:
