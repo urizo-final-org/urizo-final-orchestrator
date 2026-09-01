@@ -209,18 +209,21 @@ def register_coding_node_handlers(
             node_types=node_types,
             result_ports=ports,
             handler=_stage_handler(handler_key, dependencies),
+            config_validator=_stage_config_validator(handler_key),
         )
     registry.register(
         "coding.approval",
         node_types=["approval"],
         result_ports=["approved"],
         handler=_approval_handler(dependencies, candidate=False),
+        config_validator=_approval_config_validator(candidate=False),
     )
     registry.register(
         "coding.preview_approval",
         node_types=["approval"],
         result_ports=["approved", "rejected"],
         handler=_approval_handler(dependencies, candidate=True),
+        config_validator=_approval_config_validator(candidate=True),
     )
     node_types, ports = CODING_HANDLER_CONTRACTS["coding.rework_gate"]
     registry.register(
@@ -228,6 +231,7 @@ def register_coding_node_handlers(
         node_types=node_types,
         result_ports=ports,
         handler=_rework_gate_handler(),
+        config_validator=_rework_gate_config_failure,
     )
     return registry
 
@@ -244,11 +248,8 @@ def _rework_gate_handler() -> Any:
 
     def handle(invocation: NodeInvocation) -> NodeResult:
         config = invocation.config
-        if set(config) != {"maxReworkRounds"}:
-            raise _contract_failure("coding.rework_gate config is invalid")
+        _require_valid_config(_rework_gate_config_failure(config))
         maximum = config["maxReworkRounds"]
-        if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 1:
-            raise _contract_failure("coding.rework_gate maxReworkRounds is invalid")
         try:
             round_number, rounds = _next_round(invocation)
         except (TypeError, ValueError):
@@ -268,12 +269,7 @@ def _stage_handler(
 
     def handle(invocation: NodeInvocation) -> NodeResult:
         config = invocation.config
-        if handler_key in _EMPTY_CONFIG_HANDLERS and config:
-            raise _contract_failure(f"{handler_key} does not accept node config")
-        if handler_key == "coding.deploy_request" and config != {
-            "mode": "request_record_only"
-        }:
-            raise _contract_failure("coding.deploy_request config is invalid")
+        _require_valid_config(_stage_config_failure(handler_key, config))
 
         try:
             round_number, rounds = _next_round(invocation)
@@ -371,22 +367,11 @@ def _approval_handler(
     *,
     candidate: bool,
 ) -> Any:
-    expected_stage = "CANDIDATE" if candidate else None
-
     def handle(invocation: NodeInvocation) -> NodeResult:
         config = invocation.config
-        if set(config) != {"stage", "requiredRole"}:
-            raise _contract_failure("coding approval config is invalid")
+        _require_valid_config(_approval_config_failure(config, candidate=candidate))
         stage = config["stage"]
         required_role = config["requiredRole"]
-        if (
-            not isinstance(stage, str)
-            or stage not in APPROVAL_STAGES
-            or not isinstance(required_role, str)
-            or required_role not in APPROVAL_ROLES
-            or (expected_stage is not None) != (stage == "CANDIDATE")
-        ):
-            raise _contract_failure("coding approval config is invalid")
         round_number, rounds = _next_round(invocation)
         approval_id = _approval_id(invocation, stage, round_number)
         resumed = interrupt(
@@ -459,6 +444,65 @@ def _approval_handler(
         return NodeResult.create(port, {"codingStageRounds": rounds})
 
     return handle
+
+
+def _stage_config_validator(handler_key: str):
+    def validate(config: Mapping[str, Any]) -> str | None:
+        return _stage_config_failure(handler_key, config)
+
+    return validate
+
+
+def _stage_config_failure(
+    handler_key: str, config: Mapping[str, Any]
+) -> str | None:
+    if handler_key in _EMPTY_CONFIG_HANDLERS and config:
+        return f"{handler_key} does not accept node config"
+    if handler_key == "coding.deploy_request" and config != {
+        "mode": "request_record_only"
+    }:
+        return "coding.deploy_request config is invalid"
+    return None
+
+
+def _rework_gate_config_failure(config: Mapping[str, Any]) -> str | None:
+    if set(config) != {"maxReworkRounds"}:
+        return "coding.rework_gate config is invalid"
+    maximum = config["maxReworkRounds"]
+    if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 1:
+        return "coding.rework_gate config maxReworkRounds is invalid"
+    return None
+
+
+def _approval_config_validator(*, candidate: bool):
+    def validate(config: Mapping[str, Any]) -> str | None:
+        return _approval_config_failure(config, candidate=candidate)
+
+    return validate
+
+
+def _approval_config_failure(
+    config: Mapping[str, Any], *, candidate: bool
+) -> str | None:
+    if set(config) != {"stage", "requiredRole"}:
+        return "coding approval config is invalid"
+    stage = config["stage"]
+    required_role = config["requiredRole"]
+    expected_stage = "CANDIDATE" if candidate else None
+    if (
+        not isinstance(stage, str)
+        or stage not in APPROVAL_STAGES
+        or not isinstance(required_role, str)
+        or required_role not in APPROVAL_ROLES
+        or (expected_stage is not None) != (stage == "CANDIDATE")
+    ):
+        return "coding approval config is invalid"
+    return None
+
+
+def _require_valid_config(failure: str | None) -> None:
+    if failure is not None:
+        raise _contract_failure(failure)
 
 
 def _validate_candidate_decision(

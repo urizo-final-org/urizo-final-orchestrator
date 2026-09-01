@@ -84,6 +84,20 @@ class SnapshotGraphBuilder:
                 raise SnapshotGraphBuildError(
                     f"node '{node.node_id}' result ports do not match its registered handler"
                 )
+            try:
+                config_failure = registration.config_validator(node.config)
+            except Exception:
+                raise SnapshotGraphBuildError(
+                    f"node '{node.node_id}' config validator failed"
+                ) from None
+            if config_failure is not None:
+                if not isinstance(config_failure, str) or not config_failure:
+                    raise SnapshotGraphBuildError(
+                        f"node '{node.node_id}' config validator returned an invalid result"
+                    )
+                raise SnapshotGraphBuildError(
+                    f"node '{node.node_id}' {config_failure}"
+                )
             handlers[node.node_id] = registration.handler
 
         graph: StateGraph[_SnapshotGraphState] = StateGraph(_SnapshotGraphState)

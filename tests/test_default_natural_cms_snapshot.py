@@ -16,7 +16,10 @@ from axms_coding_orchestrator.default_natural_cms_snapshot import (
     default_natural_cms_snapshot,
     default_natural_cms_snapshot_dict,
 )
-from axms_coding_orchestrator.graph_builder import SnapshotGraphBuilder
+from axms_coding_orchestrator.graph_builder import (
+    SnapshotGraphBuildError,
+    SnapshotGraphBuilder,
+)
 from axms_coding_orchestrator.natural_cms_domain_client import (
     NaturalCmsJob,
     NaturalCmsResource,
@@ -28,7 +31,7 @@ from axms_coding_orchestrator.natural_cms_handlers import (
     register_natural_cms_node_handlers,
 )
 from axms_coding_orchestrator.node_runtime import NodeInvocation
-from axms_coding_orchestrator.snapshot import load_snapshot_json
+from axms_coding_orchestrator.snapshot import VersionedSnapshot, load_snapshot_json
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "natural-cms-handler.snapshot.valid.json"
@@ -196,6 +199,28 @@ class DefaultNaturalCmsSnapshotTest(unittest.TestCase):
 
         self.assertIsNotNone(graph)
         self.assertTrue(set(NATURAL_CMS_HANDLER_CONTRACTS).issubset(registry.registered_keys))
+
+    def test_feature_handler_configs_are_validated_before_execution(self) -> None:
+        invalid_configs = {
+            "analyze": {"unknown": True},
+            "approval": {"stage": "PREVIEW", "requiredRole": "SUPER_ADMIN"},
+        }
+
+        for node_id, config in invalid_configs.items():
+            payload = default_natural_cms_snapshot_dict()
+            node = next(item for item in payload["nodes"] if item["id"] == node_id)
+            node["config"] = config
+            snapshot = VersionedSnapshot.from_dict(payload)
+            domain = _Domain()
+            registry = register_natural_cms_node_handlers(
+                build_common_node_registry(),
+                NaturalCmsHandlerDependencies(domain, _Executor(domain)),
+            )
+
+            with self.subTest(node_id=node_id), self.assertRaisesRegex(
+                SnapshotGraphBuildError, "config"
+            ):
+                SnapshotGraphBuilder(registry).compile(snapshot)
 
     def test_rejection_discards_then_retries_same_job_before_apply(self) -> None:
         domain = _Domain()

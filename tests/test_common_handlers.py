@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import patch
 
 from axms_coding_orchestrator.common_handlers import build_common_node_registry
 from axms_coding_orchestrator.graph_builder import SnapshotGraphExecutionError
@@ -128,27 +127,11 @@ class CommonNodeHandlersTest(unittest.TestCase):
                     _invocation(key.removeprefix("common."), {"unknown": True})
                 )
 
-    def test_approval_accepts_only_the_true_interrupt_decision(
-        self,
-    ) -> None:
+    def test_unsupported_approval_handler_fails_closed(self) -> None:
         approval = self.registry.resolve("common.approval").handler
-        invocation = _invocation("approval", {})
 
-        with patch(
-            "axms_coding_orchestrator.common_handlers.interrupt",
-            return_value=True,
-        ):
-            self.assertEqual("approved", approval(invocation).port)
-        with patch(
-            "axms_coding_orchestrator.common_handlers.interrupt",
-            return_value=False,
-        ), self.assertRaises(SnapshotGraphExecutionError):
-            approval(invocation)
-        with patch(
-            "axms_coding_orchestrator.common_handlers.interrupt",
-            return_value="approved",
-        ), self.assertRaises(SnapshotGraphExecutionError):
-            approval(invocation)
+        with self.assertRaisesRegex(SnapshotGraphExecutionError, "not supported"):
+            approval(_invocation("approval", {}))
 
 
 if __name__ == "__main__":
