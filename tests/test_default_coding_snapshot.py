@@ -25,7 +25,7 @@ from axms_coding_orchestrator.snapshot import VersionedSnapshot, load_snapshot_j
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "llm-ops-coding-handler.snapshot.valid.json"
-V3_CODING_HANDLERS = frozenset(
+V4_CODING_HANDLERS = frozenset(
     {
         "coding.analyze",
         "coding.code",
@@ -34,7 +34,10 @@ V3_CODING_HANDLERS = frozenset(
         "coding.approval",
         "coding.preview_approval",
         "coding.pr_request",
+        "coding.pr_complete",
         "coding.deploy_request",
+        "coding.dev_merge_check",
+        "coding.deploy",
         "coding.rework_gate",
     }
 )
@@ -66,8 +69,8 @@ class DefaultCodingSnapshotTest(unittest.TestCase):
             for node in snapshot.nodes
             if node.handler_key.startswith("coding.")
         }
-        self.assertEqual(V3_CODING_HANDLERS, set(feature_nodes))
-        for handler_key in V3_CODING_HANDLERS:
+        self.assertEqual(V4_CODING_HANDLERS, set(feature_nodes))
+        for handler_key in V4_CODING_HANDLERS:
             _, ports = CODING_HANDLER_CONTRACTS[handler_key]
             self.assertEqual(ports, feature_nodes[handler_key])
 
@@ -76,6 +79,57 @@ class DefaultCodingSnapshotTest(unittest.TestCase):
         limits = {limit.route(): limit.max_iterations for limit in snapshot.config.loop_limits}
         self.assertEqual(2, limits[("rework_gate", "retry", "code")])
         self.assertEqual(2, limits[("preview_approval", "rejected", "analyze")])
+        self.assertEqual(2, limits[("dev_merge_check", "not_merged", "deploy_request")])
+        self.assertEqual(17, len(snapshot.nodes))
+        self.assertNotIn("cms_approval", {node.node_id for node in snapshot.nodes})
+
+    def test_v4_preserves_the_v3_pre_pr_contract_unchanged(self) -> None:
+        snapshot = default_coding_snapshot_dict()
+
+        self.assertEqual(
+            [
+                {"id": "start", "type": "start", "handlerKey": "common.start", "resultPorts": ["next"], "config": {}},
+                {"id": "guardrail", "type": "guardrail", "handlerKey": "common.guardrail", "resultPorts": ["passed", "failed"], "config": {"locked": True}},
+                {"id": "analyze", "type": "agent", "handlerKey": "coding.analyze", "resultPorts": ["feasible", "infeasible"], "config": {}},
+                {"id": "scope_approval", "type": "approval", "handlerKey": "coding.approval", "resultPorts": ["approved"], "config": {"stage": "SCOPE", "requiredRole": "GENERAL_ADMIN"}},
+                {"id": "code", "type": "agent", "handlerKey": "coding.code", "resultPorts": ["completed"], "config": {}},
+                {"id": "review", "type": "agent", "handlerKey": "coding.review", "resultPorts": ["passed", "changes_requested"], "config": {}},
+                {"id": "rework_gate", "type": "check", "handlerKey": "coding.rework_gate", "resultPorts": ["retry", "handover"], "config": {"maxReworkRounds": 3}},
+                {"id": "preview", "type": "tool", "handlerKey": "coding.preview", "resultPorts": ["ready"], "config": {}},
+                {"id": "preview_approval", "type": "approval", "handlerKey": "coding.preview_approval", "resultPorts": ["approved", "rejected"], "config": {"stage": "CANDIDATE", "requiredRole": "GENERAL_ADMIN"}},
+            ],
+            snapshot["nodes"][:9],
+        )
+        self.assertEqual(
+            {"id": "end", "type": "end", "handlerKey": "common.end", "resultPorts": [], "config": {}},
+            snapshot["nodes"][-1],
+        )
+        self.assertEqual(
+            [
+                {"from": "start", "resultPort": "next", "to": "guardrail"},
+                {"from": "guardrail", "resultPort": "passed", "to": "analyze"},
+                {"from": "guardrail", "resultPort": "failed", "to": "end"},
+                {"from": "analyze", "resultPort": "feasible", "to": "scope_approval"},
+                {"from": "analyze", "resultPort": "infeasible", "to": "end"},
+                {"from": "scope_approval", "resultPort": "approved", "to": "code"},
+                {"from": "code", "resultPort": "completed", "to": "review"},
+                {"from": "review", "resultPort": "passed", "to": "preview"},
+                {"from": "review", "resultPort": "changes_requested", "to": "rework_gate"},
+                {"from": "rework_gate", "resultPort": "retry", "to": "code"},
+                {"from": "rework_gate", "resultPort": "handover", "to": "end"},
+                {"from": "preview", "resultPort": "ready", "to": "preview_approval"},
+                {"from": "preview_approval", "resultPort": "approved", "to": "pr_request"},
+                {"from": "preview_approval", "resultPort": "rejected", "to": "analyze"},
+            ],
+            snapshot["edges"][:14],
+        )
+        self.assertEqual(
+            [
+                {"from": "rework_gate", "resultPort": "retry", "to": "code", "maxIterations": 2},
+                {"from": "preview_approval", "resultPort": "rejected", "to": "analyze", "maxIterations": 2},
+            ],
+            snapshot["config"]["loopLimits"][:2],
+        )
 
     def test_fixture_compiles_against_common_plus_coding_registry(self) -> None:
         registry = register_coding_node_handlers(

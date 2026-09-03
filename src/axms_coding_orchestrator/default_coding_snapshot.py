@@ -12,9 +12,9 @@ from .snapshot import VersionedSnapshot
 # profile_version_id with ON CONFLICT DO NOTHING and then requires the stored
 # snapshot_json to equal the seeded text, so reusing an id with changed
 # content breaks every environment that already seeded the old one.
-# uuid5(NAMESPACE_URL, "axms:LLM_OPS:profile-version:3:review-handover")
-DEFAULT_CODING_PROFILE_VERSION_ID = "79b331f0-2824-5d2a-af4c-98f58f401dec"
-DEFAULT_CODING_PROFILE_VERSION = 3
+# uuid5(NAMESPACE_URL, "axms:LLM_OPS:profile-version:4:pr-deploy-profile")
+DEFAULT_CODING_PROFILE_VERSION_ID = "dc495130-0146-5f01-8e97-3c3272ad62b0"
+DEFAULT_CODING_PROFILE_VERSION = 4
 CODING_TOOL_NAMES = (
     "read_file",
     "search_code",
@@ -110,11 +110,18 @@ _DEFAULT_CODING_SNAPSHOT: dict[str, Any] = {
             "config": {"stage": "GITHUB", "requiredRole": "SUPER_ADMIN"},
         },
         {
-            "id": "cms_approval",
-            "type": "approval",
-            "handlerKey": "coding.approval",
-            "resultPorts": ["approved"],
-            "config": {"stage": "CMS", "requiredRole": "GENERAL_ADMIN"},
+            "id": "pr_complete",
+            "type": "tool",
+            "handlerKey": "coding.pr_complete",
+            "resultPorts": ["completed"],
+            "config": {},
+        },
+        {
+            "id": "deploy_request",
+            "type": "tool",
+            "handlerKey": "coding.deploy_request",
+            "resultPorts": ["recorded"],
+            "config": {"mode": "request_record_only"},
         },
         {
             "id": "deploy_approval",
@@ -124,11 +131,18 @@ _DEFAULT_CODING_SNAPSHOT: dict[str, Any] = {
             "config": {"stage": "DEPLOY", "requiredRole": "SUPER_ADMIN"},
         },
         {
-            "id": "deploy_request",
+            "id": "dev_merge_check",
+            "type": "check",
+            "handlerKey": "coding.dev_merge_check",
+            "resultPorts": ["merged", "not_merged", "blocked"],
+            "config": {},
+        },
+        {
+            "id": "deploy",
             "type": "tool",
-            "handlerKey": "coding.deploy_request",
-            "resultPorts": ["recorded"],
-            "config": {"mode": "request_record_only"},
+            "handlerKey": "coding.deploy",
+            "resultPorts": ["completed", "blocked"],
+            "config": {},
         },
         {
             "id": "end",
@@ -166,17 +180,26 @@ _DEFAULT_CODING_SNAPSHOT: dict[str, Any] = {
             "to": "analyze",
         },
         {"from": "pr_request", "resultPort": "requested", "to": "github_approval"},
-        {"from": "github_approval", "resultPort": "approved", "to": "cms_approval"},
-        {"from": "cms_approval", "resultPort": "approved", "to": "deploy_approval"},
+        {"from": "github_approval", "resultPort": "approved", "to": "pr_complete"},
+        {"from": "pr_complete", "resultPort": "completed", "to": "deploy_request"},
+        {
+            "from": "deploy_request",
+            "resultPort": "recorded",
+            "to": "deploy_approval",
+        },
         {
             "from": "deploy_approval",
             "resultPort": "approved",
-            "to": "deploy_request",
+            "to": "dev_merge_check",
         },
-        {"from": "deploy_request", "resultPort": "recorded", "to": "end"},
+        {"from": "dev_merge_check", "resultPort": "not_merged", "to": "deploy_request"},
+        {"from": "dev_merge_check", "resultPort": "merged", "to": "deploy"},
+        {"from": "dev_merge_check", "resultPort": "blocked", "to": "end"},
+        {"from": "deploy", "resultPort": "completed", "to": "end"},
+        {"from": "deploy", "resultPort": "blocked", "to": "end"},
     ],
     "config": {
-        "maxNodes": 15,
+        "maxNodes": 17,
         "maxAttempts": 3,
         "loopLimits": [
             {
@@ -189,6 +212,12 @@ _DEFAULT_CODING_SNAPSHOT: dict[str, Any] = {
                 "from": "preview_approval",
                 "resultPort": "rejected",
                 "to": "analyze",
+                "maxIterations": 2,
+            },
+            {
+                "from": "dev_merge_check",
+                "resultPort": "not_merged",
+                "to": "deploy_request",
                 "maxIterations": 2,
             },
         ],

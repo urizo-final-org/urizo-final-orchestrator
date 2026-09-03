@@ -1,8 +1,8 @@
 {
   "contractVersion": "1.0",
-  "profileVersionId": "79b331f0-2824-5d2a-af4c-98f58f401dec",
+  "profileVersionId": "dc495130-0146-5f01-8e97-3c3272ad62b0",
   "profileKey": "LLM_OPS",
-  "profileVersion": 3,
+  "profileVersion": 4,
   "nodes": [
     {"id":"start","type":"start","handlerKey":"common.start","resultPorts":["next"],"config":{}},
     {"id":"guardrail","type":"guardrail","handlerKey":"common.guardrail","resultPorts":["passed","failed"],"config":{"locked":true}},
@@ -15,9 +15,11 @@
     {"id":"preview_approval","type":"approval","handlerKey":"coding.preview_approval","resultPorts":["approved","rejected"],"config":{"stage":"CANDIDATE","requiredRole":"GENERAL_ADMIN"}},
     {"id":"pr_request","type":"tool","handlerKey":"coding.pr_request","resultPorts":["requested"],"config":{}},
     {"id":"github_approval","type":"approval","handlerKey":"coding.approval","resultPorts":["approved"],"config":{"stage":"GITHUB","requiredRole":"SUPER_ADMIN"}},
-    {"id":"cms_approval","type":"approval","handlerKey":"coding.approval","resultPorts":["approved"],"config":{"stage":"CMS","requiredRole":"GENERAL_ADMIN"}},
-    {"id":"deploy_approval","type":"approval","handlerKey":"coding.approval","resultPorts":["approved"],"config":{"stage":"DEPLOY","requiredRole":"SUPER_ADMIN"}},
+    {"id":"pr_complete","type":"tool","handlerKey":"coding.pr_complete","resultPorts":["completed"],"config":{}},
     {"id":"deploy_request","type":"tool","handlerKey":"coding.deploy_request","resultPorts":["recorded"],"config":{"mode":"request_record_only"}},
+    {"id":"deploy_approval","type":"approval","handlerKey":"coding.approval","resultPorts":["approved"],"config":{"stage":"DEPLOY","requiredRole":"SUPER_ADMIN"}},
+    {"id":"dev_merge_check","type":"check","handlerKey":"coding.dev_merge_check","resultPorts":["merged","not_merged","blocked"],"config":{}},
+    {"id":"deploy","type":"tool","handlerKey":"coding.deploy","resultPorts":["completed","blocked"],"config":{}},
     {"id":"end","type":"end","handlerKey":"common.end","resultPorts":[],"config":{}}
   ],
   "edges": [
@@ -36,17 +38,23 @@
     {"from":"preview_approval","resultPort":"approved","to":"pr_request"},
     {"from":"preview_approval","resultPort":"rejected","to":"analyze"},
     {"from":"pr_request","resultPort":"requested","to":"github_approval"},
-    {"from":"github_approval","resultPort":"approved","to":"cms_approval"},
-    {"from":"cms_approval","resultPort":"approved","to":"deploy_approval"},
-    {"from":"deploy_approval","resultPort":"approved","to":"deploy_request"},
-    {"from":"deploy_request","resultPort":"recorded","to":"end"}
+    {"from":"github_approval","resultPort":"approved","to":"pr_complete"},
+    {"from":"pr_complete","resultPort":"completed","to":"deploy_request"},
+    {"from":"deploy_request","resultPort":"recorded","to":"deploy_approval"},
+    {"from":"deploy_approval","resultPort":"approved","to":"dev_merge_check"},
+    {"from":"dev_merge_check","resultPort":"not_merged","to":"deploy_request"},
+    {"from":"dev_merge_check","resultPort":"merged","to":"deploy"},
+    {"from":"dev_merge_check","resultPort":"blocked","to":"end"},
+    {"from":"deploy","resultPort":"completed","to":"end"},
+    {"from":"deploy","resultPort":"blocked","to":"end"}
   ],
   "config": {
-    "maxNodes": 15,
+    "maxNodes": 17,
     "maxAttempts": 3,
     "loopLimits": [
       {"from":"rework_gate","resultPort":"retry","to":"code","maxIterations":2},
-      {"from":"preview_approval","resultPort":"rejected","to":"analyze","maxIterations":2}
+      {"from":"preview_approval","resultPort":"rejected","to":"analyze","maxIterations":2},
+      {"from":"dev_merge_check","resultPort":"not_merged","to":"deploy_request","maxIterations":2}
     ]
   },
   "modelBindings": {

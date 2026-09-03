@@ -160,8 +160,13 @@ class _Domain:
 
 
 class _ScriptedExecutor:
-    def __init__(self, review_ports: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        review_ports: list[str] | None = None,
+        merge_ports: list[str] | None = None,
+    ) -> None:
         self.review_ports = list(review_ports or ["passed"])
+        self.merge_ports = list(merge_ports or ["merged"])
         self.calls: list[tuple[str, int, str]] = []
         self.counts: dict[str, int] = defaultdict(int)
 
@@ -229,29 +234,114 @@ class _ScriptedExecutor:
                 candidate_sha=preview.candidate_sha,
                 validation_hash=preview.validation_hash,
             )
-        if handler_key == "coding.deploy_request":
-            preview = next(
+        if handler_key == "coding.pr_complete":
+            request = next(
                 result
                 for result in reversed(attempt.results)
-                if result.handler_key == "coding.preview"
-                and result.result_type == "DIFF"
-                and result.result_port == "ready"
+                if result.handler_key == "coding.pr_request"
+                and result.result_port == "requested"
+            )
+            return CodingStageOutcome(
+                "completed",
+                {
+                    "repository": "backend",
+                    "base": "dev",
+                    "head": "system/llmops-" + ("a" * 32),
+                    "headSha": "sha1:" + ("a" * 40),
+                    "candidateSha": request.candidate_sha,
+                    "prNumber": 42,
+                    "prUrl": "https://github.example/pr/42",
+                },
+                candidate_sha=request.candidate_sha,
+                validation_hash=request.validation_hash,
+            )
+        if handler_key == "coding.deploy_request":
+            pull_request = next(
+                result
+                for result in reversed(attempt.results)
+                if result.handler_key == "coding.pr_complete"
+                and result.result_port == "completed"
             )
             return CodingStageOutcome(
                 "recorded",
-                {"requestRef": result_id},
-                candidate_sha=preview.candidate_sha,
-                validation_hash=preview.validation_hash,
+                {
+                    "deploymentRequestId": f"deploy-request-{index + 1}",
+                    "jobId": JOB_ID,
+                    "pipelineAttempt": invocation.pipeline_attempt,
+                    "repository": "backend",
+                    "prNumber": pull_request.payload["prNumber"],
+                    "candidateSha": pull_request.candidate_sha,
+                    "sourceValidationHash": pull_request.validation_hash,
+                    "adapterKey": "local-docker-compose",
+                    "targetKey": "full:backend:spring-app",
+                    "configDigest": pull_request.validation_hash,
+                    "status": "DEPLOY_REQUEST_RECORDED",
+                },
+                candidate_sha=pull_request.candidate_sha,
+                validation_hash=pull_request.validation_hash,
+            )
+        if handler_key == "coding.dev_merge_check":
+            deploy_request = next(
+                result
+                for result in reversed(attempt.results)
+                if result.handler_key == "coding.deploy_request"
+                and result.result_port == "recorded"
+            )
+            port = self.merge_ports[min(index, len(self.merge_ports) - 1)]
+            payload = {
+                "status": {
+                    "merged": "MERGED",
+                    "not_merged": "NOT_MERGED",
+                    "blocked": "BLOCKED",
+                }[port],
+                "candidateSha": deploy_request.candidate_sha,
+                "head": "system/llmops-" + ("a" * 32),
+                "headSha": "sha1:" + ("a" * 40),
+            }
+            if port == "merged":
+                payload["mergeSha"] = "sha1:" + ("b" * 40)
+            return CodingStageOutcome(
+                port,
+                payload,
+                candidate_sha=deploy_request.candidate_sha,
+                validation_hash=deploy_request.validation_hash,
+            )
+        if handler_key == "coding.deploy":
+            deploy_request = next(
+                result
+                for result in reversed(attempt.results)
+                if result.handler_key == "coding.deploy_request"
+                and result.result_port == "recorded"
+            )
+            merge = next(
+                result
+                for result in reversed(attempt.results)
+                if result.handler_key == "coding.dev_merge_check"
+                and result.result_port == "merged"
+            )
+            return CodingStageOutcome(
+                "completed",
+                {
+                    "deploymentRequestId": deploy_request.payload["deploymentRequestId"],
+                    "deploymentExecutionId": f"deploy-execution-{index + 1}",
+                    "mergeSha": merge.payload["mergeSha"],
+                    "status": "COMPLETED",
+                },
+                candidate_sha=deploy_request.candidate_sha,
+                validation_hash=deploy_request.validation_hash,
             )
         raise AssertionError(f"unexpected handler {handler_key}")
 
 
 class CodingHandlerGraphContractTest(unittest.TestCase):
     def _runtime(
-        self, *, review_ports: list[str] | None = None
+        self,
+        *,
+        review_ports: list[str] | None = None,
+        merge_ports: list[str] | None = None,
     ) -> tuple[object, _Domain, _ScriptedExecutor, dict[str, object]]:
         domain = _Domain()
-        executor = _ScriptedExecutor(review_ports)
+        executor = _ScriptedExecutor(review_ports, merge_ports)
         registry = register_coding_node_handlers(
             build_common_node_registry(),
             CodingHandlerDependencies(domain, executor),
@@ -271,7 +361,8 @@ class CodingHandlerGraphContractTest(unittest.TestCase):
                 "changes_requested",
                 "changes_requested",
                 "passed",
-            ]
+            ],
+            merge_ports=["not_merged", "merged"],
         )
 
         waiting = graph.invoke(_state(), config=config)  # type: ignore[attr-defined]
@@ -293,8 +384,7 @@ class CodingHandlerGraphContractTest(unittest.TestCase):
         approvals = (
             ("preview_approval", "CANDIDATE", 7),
             ("github_approval", "GITHUB", 8),
-            ("cms_approval", "CMS", 9),
-            ("deploy_approval", "DEPLOY", 10),
+            ("deploy_approval", "DEPLOY", 9),
         )
         for node_id, stage, state_version in approvals:
             domain.approve(
@@ -309,31 +399,33 @@ class CodingHandlerGraphContractTest(unittest.TestCase):
                 config=config,
             )
 
+        self.assertIn("__interrupt__", waiting)
+        domain.approve(
+            node_id="deploy_approval",
+            stage="DEPLOY",
+            stage_round=2,
+            pipeline_attempt=1,
+            state_version=10,
+        )
+        waiting = graph.invoke(  # type: ignore[attr-defined]
+            Command(resume=True, update={"stateVersion": 10}), config=config
+        )
+
         self.assertNotIn("__interrupt__", waiting)
         self.assertEqual("end", waiting["_snapshotLastNodeId"])
         self.assertEqual(1, executor.counts["coding.pr_request"])
-        self.assertEqual(1, executor.counts["coding.deploy_request"])
+        self.assertEqual(1, executor.counts["coding.pr_complete"])
+        self.assertEqual(2, executor.counts["coding.deploy_request"])
+        self.assertEqual(2, executor.counts["coding.dev_merge_check"])
+        self.assertEqual(1, executor.counts["coding.deploy"])
         self.assertEqual(
-            "recorded", waiting["context"]["codingLastResult"]["resultPort"]
+            "completed", waiting["context"]["codingLastResult"]["resultPort"]
         )
 
-    def test_reordered_snapshot_edges_control_approval_interrupts_across_restarts(
+    def test_v4_snapshot_edges_control_approval_interrupts_across_restarts(
         self,
     ) -> None:
         payload = default_coding_snapshot_dict()
-        reordered_targets = {
-            ("pr_request", "requested"): "cms_approval",
-            ("cms_approval", "approved"): "github_approval",
-            ("github_approval", "approved"): "deploy_approval",
-        }
-        changed_routes: set[tuple[str, str]] = set()
-        for edge in payload["edges"]:
-            route = (edge["from"], edge["resultPort"])
-            target = reordered_targets.get(route)
-            if target is not None:
-                edge["to"] = target
-                changed_routes.add(route)
-        self.assertEqual(set(reordered_targets), changed_routes)
         snapshot = VersionedSnapshot.from_dict(payload)
 
         domain = _Domain()
@@ -366,9 +458,8 @@ class CodingHandlerGraphContractTest(unittest.TestCase):
 
         approvals = (
             ("scope_approval", "SCOPE", 6, "preview_approval", "CANDIDATE"),
-            ("preview_approval", "CANDIDATE", 7, "cms_approval", "CMS"),
-            ("cms_approval", "CMS", 8, "github_approval", "GITHUB"),
-            ("github_approval", "GITHUB", 9, "deploy_approval", "DEPLOY"),
+            ("preview_approval", "CANDIDATE", 7, "github_approval", "GITHUB"),
+            ("github_approval", "GITHUB", 8, "deploy_approval", "DEPLOY"),
         )
         for node_id, stage, state_version, next_node_id, next_stage in approvals:
             domain.approve(
@@ -391,9 +482,9 @@ class CodingHandlerGraphContractTest(unittest.TestCase):
             stage="DEPLOY",
             stage_round=1,
             pipeline_attempt=1,
-            state_version=10,
+            state_version=9,
         )
-        completed = invoke(Command(resume=True, update={"stateVersion": 10}))
+        completed = invoke(Command(resume=True, update={"stateVersion": 9}))
 
         self.assertNotIn("__interrupt__", completed)
         self.assertEqual("end", completed["_snapshotLastNodeId"])
@@ -404,7 +495,10 @@ class CodingHandlerGraphContractTest(unittest.TestCase):
                 "coding.review": 1,
                 "coding.preview": 1,
                 "coding.pr_request": 1,
+                "coding.pr_complete": 1,
                 "coding.deploy_request": 1,
+                "coding.dev_merge_check": 1,
+                "coding.deploy": 1,
             },
             {handler: executor.counts[handler] for handler in executor.counts},
         )
