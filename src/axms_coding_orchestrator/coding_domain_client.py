@@ -35,7 +35,9 @@ RESULT_TYPES = frozenset(
         "CHECK",
         "REVIEW",
         "PULL_REQUEST",
+        "DEV_MERGE",
         "DEPLOY_REQUEST",
+        "DEPLOYMENT",
     }
 )
 RESULT_PORTS = frozenset(
@@ -51,6 +53,9 @@ RESULT_PORTS = frozenset(
         "rejected",
         "requested",
         "recorded",
+        "merged",
+        "not_merged",
+        "blocked",
     }
 )
 ATTEMPT_STATUSES = frozenset({"ACTIVE", "REJECTED", "COMPLETED", "FAILED"})

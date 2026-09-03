@@ -32,6 +32,8 @@ NOW = "2026-08-30T01:02:03Z"
 DIGEST = "sha256:" + ("a" * 64)
 SHA = "sha1:" + ("a" * 40)
 SHA_B = "sha1:" + ("b" * 40)
+MERGE_SHA = "sha1:" + ("c" * 40)
+DEPLOY_DIGEST = "sha256:" + ("d" * 64)
 
 
 def _invocation(
@@ -252,6 +254,260 @@ class _GatewayDomain(_Domain):
 
 
 class CodingStageHandlerTest(unittest.TestCase):
+    def test_external_side_effects_stop_before_executor_without_latest_approval(self) -> None:
+        base = _subject_aggregate(include_deploy=False)
+        pull_complete = _record(
+            result_id=str(uuid5(NAMESPACE_URL, "approval-preflight-pr")),
+            handler_key="coding.pr_complete",
+            result_type="PULL_REQUEST",
+            result_port="completed",
+            candidate_sha=SHA,
+            validation_hash=DIGEST,
+            payload={"repository": "backend", "prNumber": 42},
+        )
+        deploy_request = _record(
+            result_id=str(uuid5(NAMESPACE_URL, "approval-preflight-deploy-request")),
+            handler_key="coding.deploy_request",
+            result_type="DEPLOY_REQUEST",
+            result_port="recorded",
+            candidate_sha=SHA,
+            validation_hash=DEPLOY_DIGEST,
+            payload={
+                "deploymentRequestId": "81818181-8181-4181-8181-818181818181",
+                "repository": "backend",
+                "prNumber": 42,
+            },
+        )
+        merged = _record(
+            result_id=str(uuid5(NAMESPACE_URL, "approval-preflight-merge")),
+            handler_key="coding.dev_merge_check",
+            result_type="DEV_MERGE",
+            result_port="merged",
+            candidate_sha=SHA,
+            validation_hash=DIGEST,
+            payload={"mergeSha": MERGE_SHA},
+        )
+        no_github = _aggregate(
+            results=base.results,
+            decisions=tuple(item for item in base.decisions if item.stage != "GITHUB"),
+        )
+        rejected_github = CodingApprovalDecision(
+            approval_id=str(uuid5(NAMESPACE_URL, "latest-rejected-github")),
+            node_id="github_approval",
+            stage="GITHUB",
+            stage_round=2,
+            decision="REJECTED",
+            candidate_sha=SHA,
+            validation_hash=DIGEST,
+            feedback="do not create the PR",
+            actor_id=ACTOR_ID,
+            actor_role="SUPER_ADMIN",
+            result_state_version=7,
+            next_pipeline_attempt=None,
+            decided_at=NOW,
+        )
+        superseded_github = _aggregate(
+            results=base.results,
+            decisions=base.decisions + (rejected_github,),
+        )
+        cases = (
+            ("coding.pr_complete", "pr_complete", {}, no_github),
+            ("coding.pr_complete", "pr_complete", {}, superseded_github),
+            (
+                "coding.dev_merge_check",
+                "dev_merge_check",
+                {},
+                _aggregate(
+                    results=base.results + (pull_complete, deploy_request),
+                    decisions=base.decisions,
+                ),
+            ),
+            (
+                "coding.deploy",
+                "deploy",
+                {},
+                _aggregate(
+                    results=base.results + (pull_complete, deploy_request, merged),
+                    decisions=base.decisions,
+                ),
+            ),
+        )
+        for handler_key, node_id, config, aggregate in cases:
+            with self.subTest(handler_key=handler_key):
+                domain = _Domain(aggregate)
+                executor = _FixedExecutor(CodingStageOutcome("completed"))
+                handler = register_coding_node_handlers(
+                    NodeRegistry(), CodingHandlerDependencies(domain, executor)
+                ).resolve(handler_key).handler
+
+                with self.assertRaises(GraphExecutionError) as raised:
+                    handler(_invocation(node_id, config=config))
+
+                self.assertEqual("CONTRACT_VALIDATION_FAILED", raised.exception.code)
+                self.assertEqual([], executor.result_ids)
+                self.assertEqual([], domain.writes)
+
+    def test_v4_deploy_request_subject_precedes_merge_and_deploy(self) -> None:
+        base = _subject_aggregate(include_deploy=False)
+        pull_complete = _record(
+            result_id=str(uuid5(NAMESPACE_URL, "test-pr-complete")),
+            handler_key="coding.pr_complete",
+            result_type="PULL_REQUEST",
+            result_port="completed",
+            candidate_sha=SHA,
+            validation_hash=DIGEST,
+            payload={
+                "repository": "backend",
+                "base": "dev",
+                "head": "system/llmops-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "headSha": SHA_B,
+                "candidateSha": SHA,
+                "prNumber": 42,
+                "prUrl": "https://github.example/pr/42",
+            },
+        )
+        request_payload = {
+            "deploymentRequestId": "81818181-8181-4181-8181-818181818181",
+            "jobId": JOB_ID,
+            "pipelineAttempt": 1,
+            "repository": "backend",
+            "prNumber": 42,
+            "candidateSha": SHA,
+            "sourceValidationHash": DIGEST,
+            "adapterKey": "local-docker-compose",
+            "targetKey": "full:backend:spring-app",
+            "configDigest": DIGEST,
+            "status": "DEPLOY_REQUEST_RECORDED",
+        }
+        request_domain = _Domain(
+            _aggregate(
+                results=base.results + (pull_complete,), decisions=base.decisions
+            )
+        )
+        request_handler = register_coding_node_handlers(
+            NodeRegistry(),
+            CodingHandlerDependencies(
+                request_domain,
+                _FixedExecutor(
+                    CodingStageOutcome(
+                        "recorded",
+                        request_payload,
+                        candidate_sha=SHA,
+                        validation_hash=DEPLOY_DIGEST,
+                    )
+                ),
+            ),
+        ).resolve("coding.deploy_request").handler
+
+        request_result = request_handler(
+            _invocation("deploy_request", config={"mode": "request_record_only"})
+        )
+
+        self.assertEqual("recorded", request_result.port)
+        self.assertEqual("DEPLOY_REQUEST", request_domain.writes[0].result_type)
+
+        deploy_request = _record(
+            result_id=request_domain.writes[0].result_id,
+            handler_key="coding.deploy_request",
+            result_type="DEPLOY_REQUEST",
+            result_port="recorded",
+            candidate_sha=SHA,
+            validation_hash=DEPLOY_DIGEST,
+            payload=request_payload,
+        )
+        deploy_decision = CodingApprovalDecision(
+            approval_id=str(uuid5(NAMESPACE_URL, "test-deploy-approval-v4")),
+            node_id="deploy_approval",
+            stage="DEPLOY",
+            stage_round=1,
+            decision="APPROVED",
+            candidate_sha=SHA,
+            validation_hash=DEPLOY_DIGEST,
+            feedback=None,
+            actor_id=ACTOR_ID,
+            actor_role="SUPER_ADMIN",
+            result_state_version=7,
+            next_pipeline_attempt=None,
+            decided_at=NOW,
+        )
+        merge_payload = {
+            "repository": "backend",
+            "base": "dev",
+            "head": pull_complete.payload["head"],
+            "headSha": pull_complete.payload["headSha"],
+            "candidateSha": SHA,
+            "prNumber": 42,
+            "status": "MERGED",
+            "mergeSha": MERGE_SHA,
+        }
+        merge_domain = _Domain(
+            _aggregate(
+                results=base.results + (pull_complete, deploy_request),
+                decisions=base.decisions + (deploy_decision,),
+            )
+        )
+        merge_handler = register_coding_node_handlers(
+            NodeRegistry(),
+            CodingHandlerDependencies(
+                merge_domain,
+                _FixedExecutor(
+                    CodingStageOutcome(
+                        "merged",
+                        merge_payload,
+                        candidate_sha=SHA,
+                        validation_hash=DIGEST,
+                    )
+                ),
+            ),
+        ).resolve("coding.dev_merge_check").handler
+
+        merged = merge_handler(_invocation("dev_merge_check"))
+        merge_write = merge_domain.writes[0]
+        merge = _record(
+            result_id=merge_write.result_id,
+            handler_key=merge_write.handler_key,
+            result_type=merge_write.result_type,
+            result_port=merge_write.result_port,
+            candidate_sha=merge_write.candidate_sha,
+            validation_hash=merge_write.validation_hash,
+            payload=dict(merge_write.payload),
+        )
+        self.assertEqual("merged", merged.port)
+        self.assertEqual("DEV_MERGE", merge_write.result_type)
+
+        deploy_domain = _Domain(
+            _aggregate(
+                results=base.results + (pull_complete, deploy_request, merge),
+                decisions=base.decisions + (deploy_decision,),
+            )
+        )
+        deploy_payload = {
+            "deploymentRequestId": request_payload["deploymentRequestId"],
+            "deploymentExecutionId": "91919191-9191-4191-8191-919191919191",
+            "mergeSha": MERGE_SHA,
+            "status": "COMPLETED",
+        }
+        deploy_handler = register_coding_node_handlers(
+            NodeRegistry(),
+            CodingHandlerDependencies(
+                deploy_domain,
+                _FixedExecutor(
+                    CodingStageOutcome(
+                        "completed",
+                        deploy_payload,
+                        candidate_sha=SHA,
+                        validation_hash=DEPLOY_DIGEST,
+                    )
+                ),
+            ),
+        ).resolve("coding.deploy").handler
+
+        deployed = deploy_handler(_invocation("deploy"))
+
+        self.assertEqual("completed", deployed.port)
+        self.assertEqual("DEPLOYMENT", deploy_domain.writes[0].result_type)
+        self.assertNotIn("deployedPort", deploy_domain.writes[0].payload)
+
     def test_spring_gateway_stage_is_recorded_through_existing_result_api(self) -> None:
         domain = _GatewayDomain(_aggregate())
         handler = register_coding_node_handlers(

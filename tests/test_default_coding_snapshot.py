@@ -25,6 +25,19 @@ from axms_coding_orchestrator.snapshot import VersionedSnapshot, load_snapshot_j
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "llm-ops-coding-handler.snapshot.valid.json"
+V3_CODING_HANDLERS = frozenset(
+    {
+        "coding.analyze",
+        "coding.code",
+        "coding.review",
+        "coding.preview",
+        "coding.approval",
+        "coding.preview_approval",
+        "coding.pr_request",
+        "coding.deploy_request",
+        "coding.rework_gate",
+    }
+)
 
 
 class _Domain:
@@ -53,7 +66,9 @@ class DefaultCodingSnapshotTest(unittest.TestCase):
             for node in snapshot.nodes
             if node.handler_key.startswith("coding.")
         }
-        for handler_key, (_, ports) in CODING_HANDLER_CONTRACTS.items():
+        self.assertEqual(V3_CODING_HANDLERS, set(feature_nodes))
+        for handler_key in V3_CODING_HANDLERS:
+            _, ports = CODING_HANDLER_CONTRACTS[handler_key]
             self.assertEqual(ports, feature_nodes[handler_key])
 
         self.assertEqual({"analyze", "code", "review"}, set(snapshot.model_bindings))
