@@ -111,6 +111,18 @@ _DEFAULT_NATURAL_CMS_SNAPSHOT: dict[str, Any] = {
         "analyze": {"primary": "natural-cms-analyze", "fallback": []},
         "preview": {"primary": "natural-cms-command", "fallback": []},
     },
+    "toolBindings": {
+        "preview": {
+            "validate_cms_command": "MODEL_REQUIRED",
+            "resolve_cms_target": "SYSTEM_REQUIRED",
+            "create_cms_preview": "SYSTEM_REQUIRED",
+        },
+        "discard": {"discard_cms_preview": "SYSTEM_REQUIRED"},
+        "apply": {
+            "revalidate_cms_preview": "SYSTEM_REQUIRED",
+            "apply_cms_preview": "SYSTEM_REQUIRED",
+        },
+    },
     "toolPolicy": {"allowedTools": list(CMS_TOOL_NAMES)},
     "guardrailProfileKey": "central.default",
 }

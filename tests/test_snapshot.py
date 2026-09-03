@@ -237,6 +237,38 @@ class VersionedSnapshotLoaderTest(unittest.TestCase):
         self.assertEqual(payload["toolPolicy"], snapshot.tool_policy)
         self.assertEqual(payload, load_snapshot_json(snapshot.to_json()).to_dict())
 
+    def test_optional_tool_bindings_round_trip_immutably_without_semantic_revalidation(
+        self,
+    ) -> None:
+        payload = valid_snapshot()
+        payload["toolBindings"] = {
+            "analyze": {
+                "read_file": "MODEL_OPTIONAL",
+                "run_check": "SYSTEM_REQUIRED",
+            }
+        }
+
+        snapshot = VersionedSnapshot.from_dict(payload)
+        payload["toolBindings"]["analyze"]["read_file"] = "changed"  # type: ignore[index]
+        returned = snapshot.to_dict()
+        returned["toolBindings"]["analyze"]["run_check"] = "changed"  # type: ignore[index]
+
+        self.assertEqual(
+            {"analyze": {"read_file": "MODEL_OPTIONAL", "run_check": "SYSTEM_REQUIRED"}},
+            snapshot.tool_bindings,
+        )
+        self.assertEqual(snapshot, load_snapshot_json(snapshot.to_json()))
+        changed = snapshot.to_dict()
+        changed["toolBindings"]["analyze"]["read_file"] = "SYSTEM_REQUIRED"  # type: ignore[index]
+        self.assertNotEqual(
+            hashlib.sha256(snapshot.to_json()).hexdigest(),
+            hashlib.sha256(VersionedSnapshot.from_dict(changed).to_json()).hexdigest(),
+        )
+
+        legacy = VersionedSnapshot.from_dict(valid_snapshot())
+        self.assertIsNone(legacy.tool_bindings)
+        self.assertNotIn("toolBindings", legacy.to_dict())
+
     def test_optional_model_selection_metadata_round_trips_with_stable_digest(self) -> None:
         metadata = {
             "provider": "OPENAI",
