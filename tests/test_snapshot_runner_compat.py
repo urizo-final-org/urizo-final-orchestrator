@@ -82,6 +82,7 @@ def _snapshot(
     *,
     profile_version_id: str = PROFILE_VERSION_ID,
     loop_limits: list[dict[str, Any]] | None = None,
+    model_bindings: Mapping[str, Any] | None = None,
 ) -> VersionedSnapshot:
     return VersionedSnapshot.from_dict(
         {
@@ -96,7 +97,7 @@ def _snapshot(
                 "maxAttempts": 3,
                 "loopLimits": list(loop_limits or []),
             },
-            "modelBindings": {},
+            "modelBindings": dict(model_bindings or {}),
             "toolPolicy": {},
             "guardrailProfileKey": "fixture.locked",
         }
@@ -130,6 +131,9 @@ def _linear_snapshot(
 
 def _interrupt_snapshot(
     profile_version_id: str = PROFILE_VERSION_ID,
+    *,
+    work_node_type: str = "check",
+    model_bindings: Mapping[str, Any] | None = None,
 ) -> VersionedSnapshot:
     return _snapshot(
         [
@@ -141,7 +145,7 @@ def _interrupt_snapshot(
                 ["fixture_passed"],
                 {"locked": True},
             ),
-            _node("fixture_work", "check", "fixture.work", ["fixture_ready"]),
+            _node("fixture_work", work_node_type, "fixture.work", ["fixture_ready"]),
             _node(
                 "fixture_pause",
                 "approval",
@@ -157,6 +161,7 @@ def _interrupt_snapshot(
             _edge("fixture_pause", "fixture_resumed", "fixture_end"),
         ],
         profile_version_id=profile_version_id,
+        model_bindings=model_bindings,
     )
 
 
@@ -1458,9 +1463,34 @@ class SnapshotRunnerCompatibilityTest(unittest.TestCase):
         self.assertEqual(before_resume, log)
 
     def test_resume_rejects_same_profile_id_content_drift_by_digest(self) -> None:
-        original = _interrupt_snapshot()
+        original = _interrupt_snapshot(
+            work_node_type="agent",
+            model_bindings={
+                "fixture_work": {
+                    "selections": {
+                        "provider": "OPENAI",
+                        "model": "gpt-5.6-terra",
+                        "inference": {
+                            "reasoningIntensity": "medium",
+                            "reasoningBudgetTokens": 1024,
+                        },
+                    }
+                }
+            },
+        )
         changed_payload = original.to_dict()
-        changed_payload["guardrailProfileKey"] = "fixture.changed"
+        changed_payload["modelBindings"] = {
+            "fixture_work": {
+                "selections": {
+                    "provider": "OPENAI",
+                    "model": "gpt-5.6-terra",
+                    "inference": {
+                        "reasoningIntensity": "medium",
+                        "reasoningBudgetTokens": 2048,
+                    },
+                }
+            }
+        }
         changed = VersionedSnapshot.from_dict(changed_payload)
         log: list[tuple[str, NodeInvocation]] = []
 

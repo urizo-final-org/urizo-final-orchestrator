@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import FrozenInstanceError
+import hashlib
 import json
 from pathlib import Path
 import unittest
@@ -235,6 +236,51 @@ class VersionedSnapshotLoaderTest(unittest.TestCase):
         self.assertEqual(payload["modelBindings"], snapshot.model_bindings)
         self.assertEqual(payload["toolPolicy"], snapshot.tool_policy)
         self.assertEqual(payload, load_snapshot_json(snapshot.to_json()).to_dict())
+
+    def test_optional_model_selection_metadata_round_trips_with_stable_digest(self) -> None:
+        metadata = {
+            "provider": "OPENAI",
+            "model": "gpt-5.6-terra",
+            "inference": {
+                "reasoningIntensity": "medium",
+                "reasoningBudgetTokens": 2048,
+            },
+        }
+        first_payload = valid_snapshot()
+        first_payload["modelBindings"] = {"analyze": {"selections": metadata}}
+        second_payload = valid_snapshot()
+        second_payload["modelBindings"] = {
+            "analyze": {
+                "selections": {
+                    "inference": {
+                        "reasoningBudgetTokens": 2048,
+                        "reasoningIntensity": "medium",
+                    },
+                    "model": "gpt-5.6-terra",
+                    "provider": "OPENAI",
+                }
+            }
+        }
+
+        first = VersionedSnapshot.from_dict(first_payload)
+        second = VersionedSnapshot.from_dict(second_payload)
+        changed_payload = deepcopy(first_payload)
+        changed_payload["modelBindings"]["analyze"]["selections"]["inference"][  # type: ignore[index]
+            "reasoningBudgetTokens"
+        ] = 4096
+        changed = VersionedSnapshot.from_dict(changed_payload)
+
+        self.assertEqual(first_payload["modelBindings"], first.model_bindings)
+        self.assertEqual(first.to_json(), second.to_json())
+        self.assertEqual(
+            hashlib.sha256(first.to_json()).hexdigest(),
+            hashlib.sha256(second.to_json()).hexdigest(),
+        )
+        self.assertNotEqual(first.to_json(), changed.to_json())
+        self.assertNotEqual(
+            hashlib.sha256(first.to_json()).hexdigest(),
+            hashlib.sha256(changed.to_json()).hexdigest(),
+        )
 
     def test_documented_node_types_are_accepted_structurally(self) -> None:
         for node_type in (
