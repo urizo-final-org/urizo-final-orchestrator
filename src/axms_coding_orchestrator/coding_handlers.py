@@ -35,7 +35,13 @@ CODING_HANDLER_CONTRACTS: Mapping[str, tuple[frozenset[str], frozenset[str]]] = 
         frozenset({"approved", "rejected"}),
     ),
     "coding.pr_request": (frozenset({"tool"}), frozenset({"requested"})),
+    "coding.pr_complete": (frozenset({"tool"}), frozenset({"completed"})),
+    "coding.dev_merge_check": (
+        frozenset({"check"}),
+        frozenset({"merged", "not_merged", "blocked"}),
+    ),
     "coding.deploy_request": (frozenset({"tool"}), frozenset({"recorded"})),
+    "coding.deploy": (frozenset({"tool"}), frozenset({"completed", "blocked"})),
     "coding.rework_gate": (
         frozenset({"check"}),
         frozenset({"retry", "handover"}),
@@ -48,7 +54,10 @@ _STAGE_RESULT_TYPES = {
     "coding.review": "REVIEW",
     "coding.preview": "DIFF",
     "coding.pr_request": "PULL_REQUEST",
+    "coding.pr_complete": "PULL_REQUEST",
+    "coding.dev_merge_check": "DEV_MERGE",
     "coding.deploy_request": "DEPLOY_REQUEST",
+    "coding.deploy": "DEPLOYMENT",
 }
 _EMPTY_CONFIG_HANDLERS = frozenset(
     {
@@ -57,6 +66,9 @@ _EMPTY_CONFIG_HANDLERS = frozenset(
         "coding.review",
         "coding.preview",
         "coding.pr_request",
+        "coding.pr_complete",
+        "coding.dev_merge_check",
+        "coding.deploy",
     }
 )
 
@@ -298,6 +310,7 @@ def _stage_handler(
                 and outcome.candidate_sha != required_candidate
             ):
                 raise ValueError("Coding stage result changed the reviewed candidate")
+            _validate_stage_outcome_contract(handler_key, aggregate, outcome)
             workspace_id = (
                 outcome.workspace_id
                 or aggregate.workspace_id
@@ -547,7 +560,11 @@ def _validate_post_preview_decision(
     aggregate: CodingAttemptAggregate,
     decision: Any,
 ) -> None:
-    subject = _latest_preview_subject(aggregate)
+    subject = (
+        _latest_deploy_request_subject(aggregate)
+        if decision.stage == "DEPLOY" and _has_v4_deploy_request(aggregate)
+        else _latest_preview_subject(aggregate)
+    )
     if _decision_subject(decision) != subject:
         raise ValueError("post-preview approval changed the candidate subject")
     if decision.stage == "GITHUB":
@@ -555,9 +572,9 @@ def _validate_post_preview_decision(
         requests = [
             result
             for result in aggregate.results
-            if result.handler_key == "coding.pr_request"
+            if result.handler_key in {"coding.pr_request", "coding.pr_complete"}
             and result.result_type == "PULL_REQUEST"
-            and result.result_port == "requested"
+            and result.result_port in {"requested", "completed"}
         ]
         if (
             not requests
@@ -570,10 +587,44 @@ def _stage_required_subject(
     handler_key: str,
     aggregate: CodingAttemptAggregate,
 ) -> tuple[str, str] | None:
-    required_stage = {
-        "coding.pr_request": "CANDIDATE",
-        "coding.deploy_request": "DEPLOY",
-    }.get(handler_key)
+    required_stage = {"coding.pr_request": "CANDIDATE"}.get(handler_key)
+    if handler_key == "coding.pr_complete":
+        subject = _latest_result_subject(
+            aggregate, "coding.pr_request", "PULL_REQUEST", "requested"
+        )
+        _require_approved_decision(aggregate, "GITHUB", subject)
+        return subject
+    if handler_key == "coding.dev_merge_check":
+        pull_request = _latest_result(
+            aggregate, "coding.pr_complete", "PULL_REQUEST", "completed"
+        )
+        deploy_request = _latest_v4_deploy_request(aggregate)
+        _require_matching_pr_identity(pull_request, deploy_request)
+        deploy_subject = _result_subject(deploy_request)
+        _require_approved_decision(aggregate, "DEPLOY", deploy_subject)
+        return _result_subject(pull_request)
+    if handler_key == "coding.deploy_request" and _has_completed_pull_request(aggregate):
+        pull_request_subject = _latest_result_subject(
+            aggregate, "coding.pr_complete", "PULL_REQUEST", "completed"
+        )
+        _require_approved_decision(aggregate, "GITHUB", pull_request_subject)
+        return None
+    if handler_key == "coding.deploy_request":
+        required_stage = "DEPLOY"
+    if handler_key == "coding.deploy":
+        deploy_request = _latest_v4_deploy_request(aggregate)
+        pull_request = _latest_result(
+            aggregate, "coding.pr_complete", "PULL_REQUEST", "completed"
+        )
+        _require_matching_pr_identity(pull_request, deploy_request)
+        subject = _result_subject(deploy_request)
+        _require_approved_decision(aggregate, "DEPLOY", subject)
+        merge_subject = _latest_result_subject(
+            aggregate, "coding.dev_merge_check", "DEV_MERGE", "merged"
+        )
+        if merge_subject[0] != subject[0]:
+            raise ValueError("dev merge changed the deployment candidate")
+        return subject
     if required_stage is None:
         return None
     subject = _latest_preview_subject(aggregate)
@@ -606,7 +657,93 @@ def _stage_required_candidate(
         if reviewed_candidate is None or reviewed_candidate != code_candidate:
             raise ValueError("Coding review changed the latest code candidate")
         return reviewed_candidate
+    if handler_key == "coding.deploy_request" and _has_completed_pull_request(aggregate):
+        return _latest_result_subject(
+            aggregate, "coding.pr_complete", "PULL_REQUEST", "completed"
+        )[0]
     return None
+
+
+def _validate_stage_outcome_contract(
+    handler_key: str,
+    aggregate: CodingAttemptAggregate,
+    outcome: CodingStageOutcome,
+) -> None:
+    payload = outcome.payload
+    if handler_key == "coding.pr_complete":
+        if (
+            payload.get("repository") != "backend"
+            or payload.get("base") != "dev"
+            or payload.get("candidateSha") != outcome.candidate_sha
+            or not isinstance(payload.get("head"), str)
+            or not payload["head"].startswith("system/llmops-")
+            or not isinstance(payload.get("headSha"), str)
+            or GIT_OBJECT_ID.fullmatch(payload["headSha"]) is None
+            or isinstance(payload.get("prNumber"), bool)
+            or not isinstance(payload.get("prNumber"), int)
+            or payload["prNumber"] < 1
+            or not isinstance(payload.get("prUrl"), str)
+            or not payload["prUrl"]
+        ):
+            raise ValueError("pull request receipt is invalid")
+    elif handler_key == "coding.dev_merge_check":
+        expected_status = {
+            "merged": "MERGED",
+            "not_merged": "NOT_MERGED",
+            "blocked": "BLOCKED",
+        }[outcome.port]
+        if payload.get("status") != expected_status:
+            raise ValueError("dev merge receipt status is invalid")
+        if (
+            payload.get("candidateSha") != outcome.candidate_sha
+            or not isinstance(payload.get("head"), str)
+            or not isinstance(payload.get("headSha"), str)
+            or GIT_OBJECT_ID.fullmatch(payload["headSha"]) is None
+        ):
+            raise ValueError("dev merge receipt subject is invalid")
+        if outcome.port == "merged" and (
+            not isinstance(payload.get("mergeSha"), str)
+            or GIT_OBJECT_ID.fullmatch(payload["mergeSha"]) is None
+        ):
+            raise ValueError("dev merge receipt SHA is invalid")
+    elif handler_key == "coding.deploy_request" and _has_completed_pull_request(aggregate):
+        required = {
+            "deploymentRequestId",
+            "jobId",
+            "pipelineAttempt",
+            "repository",
+            "prNumber",
+            "candidateSha",
+            "sourceValidationHash",
+            "adapterKey",
+            "targetKey",
+            "configDigest",
+            "status",
+        }
+        pull_request = _latest_result(
+            aggregate, "coding.pr_complete", "PULL_REQUEST", "completed"
+        )
+        if (
+            not required.issubset(payload)
+            or payload.get("jobId") != aggregate.job_id
+            or payload.get("pipelineAttempt") != aggregate.pipeline_attempt
+            or payload.get("candidateSha") != pull_request.candidate_sha
+            or payload.get("sourceValidationHash") != pull_request.validation_hash
+            or payload.get("repository") != "backend"
+            or not isinstance(payload.get("deploymentRequestId"), str)
+            or not isinstance(outcome.validation_hash, str)
+        ):
+            raise ValueError("deployment request subject is invalid")
+    elif handler_key == "coding.deploy":
+        if (
+            not isinstance(payload.get("deploymentRequestId"), str)
+            or not isinstance(payload.get("deploymentExecutionId"), str)
+            or not isinstance(payload.get("mergeSha"), str)
+            or GIT_OBJECT_ID.fullmatch(payload["mergeSha"]) is None
+            or "port" in payload
+            or "deployedPort" in payload
+        ):
+            raise ValueError("deployment receipt is invalid")
 
 
 def _latest_code_candidate(aggregate: CodingAttemptAggregate) -> str:
@@ -641,6 +778,99 @@ def _latest_preview_subject(aggregate: CodingAttemptAggregate) -> tuple[str, str
     return preview.candidate_sha, preview.validation_hash
 
 
+def _latest_result(
+    aggregate: CodingAttemptAggregate,
+    handler_key: str,
+    result_type: str,
+    result_port: str,
+) -> Any:
+    matches = [
+        result
+        for result in aggregate.results
+        if result.handler_key == handler_key
+        and result.result_type == result_type
+        and result.result_port == result_port
+    ]
+    if not matches:
+        raise ValueError(f"Coding prerequisite {handler_key} is missing")
+    return matches[-1]
+
+
+def _latest_result_subject(
+    aggregate: CodingAttemptAggregate,
+    handler_key: str,
+    result_type: str,
+    result_port: str,
+) -> tuple[str, str]:
+    result = _latest_result(aggregate, handler_key, result_type, result_port)
+    return _result_subject(result)
+
+
+def _result_subject(result: Any) -> tuple[str, str]:
+    if result.candidate_sha is None or result.validation_hash is None:
+        raise ValueError("Coding prerequisite has no subject")
+    return result.candidate_sha, result.validation_hash
+
+
+def _latest_v4_deploy_request(aggregate: CodingAttemptAggregate) -> Any:
+    matches = [
+        result
+        for result in aggregate.results
+        if result.handler_key == "coding.deploy_request"
+        and result.result_type == "DEPLOY_REQUEST"
+        and result.result_port == "recorded"
+        and isinstance(result.payload.get("deploymentRequestId"), str)
+    ]
+    if not matches:
+        raise ValueError("Coding deployment request is missing")
+    return matches[-1]
+
+
+def _require_matching_pr_identity(pull_request: Any, deploy_request: Any) -> None:
+    if (
+        pull_request.candidate_sha != deploy_request.candidate_sha
+        or pull_request.payload.get("repository")
+        != deploy_request.payload.get("repository")
+        or pull_request.payload.get("prNumber") != deploy_request.payload.get("prNumber")
+    ):
+        raise ValueError("deployment request changed the completed pull request")
+
+
+def _has_completed_pull_request(aggregate: CodingAttemptAggregate) -> bool:
+    return any(
+        result.handler_key == "coding.pr_complete"
+        and result.result_type == "PULL_REQUEST"
+        and result.result_port == "completed"
+        for result in aggregate.results
+    )
+
+
+def _has_v4_deploy_request(aggregate: CodingAttemptAggregate) -> bool:
+    return any(
+        result.handler_key == "coding.deploy_request"
+        and result.result_type == "DEPLOY_REQUEST"
+        and result.result_port == "recorded"
+        and isinstance(result.payload.get("deploymentRequestId"), str)
+        for result in aggregate.results
+    )
+
+
+def _latest_deploy_request_subject(
+    aggregate: CodingAttemptAggregate,
+) -> tuple[str, str]:
+    matches = [
+        result
+        for result in aggregate.results
+        if result.handler_key == "coding.deploy_request"
+        and result.result_type == "DEPLOY_REQUEST"
+        and result.result_port == "recorded"
+        and isinstance(result.payload.get("deploymentRequestId"), str)
+    ]
+    if not matches or matches[-1].candidate_sha is None or matches[-1].validation_hash is None:
+        raise ValueError("Coding deployment request has no stable subject")
+    return matches[-1].candidate_sha, matches[-1].validation_hash
+
+
 def _decision_subject(decision: Any) -> tuple[str | None, str | None]:
     return decision.candidate_sha, decision.validation_hash
 
@@ -653,9 +883,13 @@ def _require_approved_decision(
     decisions = [
         item
         for item in aggregate.decisions
-        if item.stage == stage and item.decision == "APPROVED"
+        if item.stage == stage
     ]
-    if not decisions or _decision_subject(decisions[-1]) != subject:
+    if (
+        not decisions
+        or decisions[-1].decision != "APPROVED"
+        or _decision_subject(decisions[-1]) != subject
+    ):
         raise ValueError("Coding request is not bound to its prior approval")
     return decisions[-1]
 
