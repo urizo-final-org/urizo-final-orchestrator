@@ -8,6 +8,7 @@ from axms_coding_orchestrator.contracts import QueuedJobReference
 from axms_coding_orchestrator.model_gateway import ServiceCredentialLease
 from axms_coding_orchestrator.natural_cms_domain_client import (
     NaturalCmsJob,
+    NaturalCmsResource,
     NaturalCmsStageResult,
     SpringNaturalCmsDomainClient,
 )
@@ -21,6 +22,18 @@ RESULT_ID = "44444444-4444-4444-8444-444444444444"
 
 
 class SpringNaturalCmsDomainClientTest(unittest.TestCase):
+    def test_resource_accepts_supported_types_and_preserves_type(self) -> None:
+        for resource_type in ("MENU", "BOARD", "CONTENT", "TEMPLATE"):
+            with self.subTest(resource_type=resource_type):
+                resource = NaturalCmsResource.from_dict({"type": resource_type, "id": "7"})
+
+                self.assertEqual(resource_type, resource.type)
+                self.assertEqual("7", resource.id)
+
+    def test_resource_rejects_unsupported_type(self) -> None:
+        with self.assertRaisesRegex(ValueError, "resource is invalid"):
+            NaturalCmsResource.from_dict({"type": "CMS_COMPOSITE", "id": "7"})
+
     def test_resolve_job_uses_the_job_id_only_spring_boundary(self) -> None:
         response = {
             "schemaVersion": "1.0",

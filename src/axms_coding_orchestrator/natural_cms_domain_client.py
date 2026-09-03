@@ -28,6 +28,7 @@ CMS_DECISIONS = frozenset({"APPROVED", "REJECTED"})
 CMS_PORTS = frozenset(
     {"feasible", "infeasible", "ready", "approved", "rejected", "retry", "discarded", "applied"}
 )
+CMS_RESOURCE_TYPES = frozenset({"MENU", "BOARD", "CONTENT", "TEMPLATE"})
 RESOURCE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 SAFE_ERROR_CODE = re.compile(r"^[A-Z][A-Z0-9_]{2,119}$")
 
@@ -55,12 +56,13 @@ class NaturalCmsResource:
     @classmethod
     def from_dict(cls, value: Any) -> "NaturalCmsResource":
         data = _object(value, "resource")
-        if set(data) != {"type", "id"} or data.get("type") != "CONTENT":
+        resource_type = data.get("type")
+        if set(data) != {"type", "id"} or resource_type not in CMS_RESOURCE_TYPES:
             raise ValueError("resource is invalid")
         identifier = data.get("id")
         if not isinstance(identifier, str) or RESOURCE_ID.fullmatch(identifier) is None:
             raise ValueError("resource.id is invalid")
-        return cls("CONTENT", identifier)
+        return cls(resource_type, identifier)
 
 
 @dataclass(frozen=True, slots=True)
