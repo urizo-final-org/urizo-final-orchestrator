@@ -237,6 +237,7 @@ class VersionedSnapshot(_FactoryOnly):
     edges: tuple[SnapshotEdge, ...]
     config: SnapshotConfig
     _model_bindings: Mapping[str, JsonValue] = field(repr=False)
+    _tool_bindings: Mapping[str, JsonValue] | None = field(repr=False)
     _tool_policy: Mapping[str, JsonValue] = field(repr=False)
     guardrail_profile_key: str
 
@@ -247,22 +248,21 @@ class VersionedSnapshot(_FactoryOnly):
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> VersionedSnapshot:
         payload = _object(value, "snapshot")
-        _exact_fields(
-            payload,
-            {
-                "contractVersion",
-                "profileVersionId",
-                "profileKey",
-                "profileVersion",
-                "nodes",
-                "edges",
-                "config",
-                "modelBindings",
-                "toolPolicy",
-                "guardrailProfileKey",
-            },
-            "snapshot",
-        )
+        expected_fields = {
+            "contractVersion",
+            "profileVersionId",
+            "profileKey",
+            "profileVersion",
+            "nodes",
+            "edges",
+            "config",
+            "modelBindings",
+            "toolPolicy",
+            "guardrailProfileKey",
+        }
+        if "toolBindings" in payload:
+            expected_fields.add("toolBindings")
+        _exact_fields(payload, expected_fields, "snapshot")
         if payload["contractVersion"] != SNAPSHOT_CONTRACT_VERSION:
             raise SnapshotContractViolation("snapshot.contractVersion is unsupported")
         profile_version_id = _uuid(payload["profileVersionId"], "snapshot.profileVersionId")
@@ -278,6 +278,11 @@ class VersionedSnapshot(_FactoryOnly):
             for edge in _list(payload["edges"], "snapshot.edges")
         )
         model_bindings = _freeze_model_bindings(payload["modelBindings"])
+        tool_bindings = (
+            _freeze_tool_bindings(payload["toolBindings"])
+            if "toolBindings" in payload
+            else None
+        )
         tool_policy = _freeze_tool_policy(payload["toolPolicy"])
         snapshot = object.__new__(cls)
         object.__setattr__(snapshot, "contract_version", SNAPSHOT_CONTRACT_VERSION)
@@ -292,6 +297,7 @@ class VersionedSnapshot(_FactoryOnly):
         object.__setattr__(snapshot, "edges", edges)
         object.__setattr__(snapshot, "config", SnapshotConfig.from_dict(payload["config"]))
         object.__setattr__(snapshot, "_model_bindings", model_bindings)
+        object.__setattr__(snapshot, "_tool_bindings", tool_bindings)
         object.__setattr__(snapshot, "_tool_policy", tool_policy)
         object.__setattr__(
             snapshot,
@@ -311,11 +317,17 @@ class VersionedSnapshot(_FactoryOnly):
         return _thaw_object(self._model_bindings)
 
     @property
+    def tool_bindings(self) -> dict[str, Any] | None:
+        if self._tool_bindings is None:
+            return None
+        return _thaw_object(self._tool_bindings)
+
+    @property
     def tool_policy(self) -> dict[str, Any]:
         return _thaw_object(self._tool_policy)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "contractVersion": self.contract_version,
             "profileVersionId": self.profile_version_id,
             "profileKey": self.profile_key,
@@ -324,9 +336,12 @@ class VersionedSnapshot(_FactoryOnly):
             "edges": [edge.to_dict() for edge in self.edges],
             "config": self.config.to_dict(),
             "modelBindings": self.model_bindings,
-            "toolPolicy": self.tool_policy,
-            "guardrailProfileKey": self.guardrail_profile_key,
         }
+        if self._tool_bindings is not None:
+            result["toolBindings"] = self.tool_bindings
+        result["toolPolicy"] = self.tool_policy
+        result["guardrailProfileKey"] = self.guardrail_profile_key
+        return result
 
     def to_json(self) -> bytes:
         return json.dumps(
@@ -555,6 +570,17 @@ def _freeze_model_bindings(value: Any) -> Mapping[str, JsonValue]:
         result[node_id] = _freeze_object(
             value, "snapshot.modelBindings value"
         )
+    return MappingProxyType(result)
+
+
+def _freeze_tool_bindings(value: Any) -> Mapping[str, JsonValue]:
+    """Freeze the Backend-owned node/tool binding shape without revalidating it."""
+
+    payload = _object(value, "snapshot.toolBindings")
+    result: dict[str, JsonValue] = {}
+    for node_id, binding in payload.items():
+        _matched(node_id, NODE_IDENTIFIER, "snapshot.toolBindings key", 64)
+        result[node_id] = _freeze_object(binding, "snapshot.toolBindings value")
     return MappingProxyType(result)
 
 

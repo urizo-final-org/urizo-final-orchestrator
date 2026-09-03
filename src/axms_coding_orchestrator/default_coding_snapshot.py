@@ -227,6 +227,31 @@ _DEFAULT_CODING_SNAPSHOT: dict[str, Any] = {
         "code": {"primary": "llm-ops-code", "fallback": []},
         "review": {"primary": "llm-ops-review", "fallback": []},
     },
+    "toolBindings": {
+        "code": {
+            "read_file": "MODEL_OPTIONAL",
+            "search_code": "MODEL_OPTIONAL",
+            "read_diff": "MODEL_OPTIONAL",
+            "apply_patch": "MODEL_OPTIONAL",
+            "run_check": "MODEL_OPTIONAL",
+            "check_package_allowlist": "MODEL_OPTIONAL",
+            "scan_changed_files": "MODEL_OPTIONAL",
+        },
+        "review": {
+            "read_file": "MODEL_OPTIONAL",
+            "search_code": "MODEL_OPTIONAL",
+            "read_diff": "MODEL_OPTIONAL",
+            "run_check": "MODEL_OPTIONAL",
+            "check_package_allowlist": "MODEL_OPTIONAL",
+            "scan_changed_files": "MODEL_OPTIONAL",
+        },
+        "preview": {
+            "read_diff": "SYSTEM_REQUIRED",
+            "run_check": "SYSTEM_REQUIRED",
+            "check_package_allowlist": "SYSTEM_REQUIRED",
+            "scan_changed_files": "SYSTEM_REQUIRED",
+        },
+    },
     "toolPolicy": {"allowedTools": list(CODING_TOOL_NAMES)},
     "guardrailProfileKey": "central.default",
 }
