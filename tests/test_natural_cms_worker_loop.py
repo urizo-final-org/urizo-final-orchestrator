@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from contextlib import contextmanager
+from types import SimpleNamespace
+from typing import Any, Iterator
 import unittest
 
 from langgraph.checkpoint.memory import InMemorySaver
@@ -185,6 +188,19 @@ class _FailingRunner:
         raise self.failure
 
 
+class _ObservationProbe:
+    def __init__(self) -> None:
+        self.job_attempts: list[int] = []
+
+    @contextmanager
+    def job(self, **values: Any) -> Iterator[SimpleNamespace]:
+        self.job_attempts.append(values["attempt"])
+        yield SimpleNamespace(finish=lambda _status: None)
+
+    def invoke_node(self, *, invocation: Any, handler: Any, **_values: Any) -> Any:
+        return handler(invocation)
+
+
 class _RunQueue:
     def __init__(self, delivery: QueueDelivery) -> None:
         self.delivery = delivery
@@ -215,6 +231,7 @@ class NaturalCmsWorkerLoopTest(unittest.TestCase):
     def _runner(
         spring: _SpringNaturalCms,
         checkpointer: InMemorySaver | None = None,
+        observability: _ObservationProbe | None = None,
     ) -> tuple[NaturalCmsSnapshotRunner, InMemorySaver]:
         registry = register_natural_cms_node_handlers(
             build_common_node_registry(),
@@ -225,9 +242,31 @@ class NaturalCmsWorkerLoopTest(unittest.TestCase):
         )
         saver = checkpointer or InMemorySaver()
         return (
-            NaturalCmsSnapshotRunner(spring, _Profiles(), registry, saver),
+            NaturalCmsSnapshotRunner(
+                spring,
+                _Profiles(),
+                registry,
+                saver,
+                observability,  # type: ignore[arg-type]
+            ),
             saver,
         )
+
+    def test_root_observation_uses_pipeline_attempt_not_state_version(self) -> None:
+        spring = _SpringNaturalCms()
+        spring.pipeline_attempt = 2
+        spring.state_version = 7
+        observations = _ObservationProbe()
+        runner, _checkpointer = self._runner(
+            spring, observability=observations
+        )
+
+        result = runner.invoke(
+            QueuedJobReference.from_dict({"jobId": JOB_ID})
+        )
+
+        self.assertEqual("WAITING_APPROVAL", result["status"])
+        self.assertEqual([2], observations.job_attempts)
 
     def test_permanent_poison_is_acked_but_transient_failure_is_requeued(self) -> None:
         reference = QueuedJobReference.from_dict({"jobId": JOB_ID})

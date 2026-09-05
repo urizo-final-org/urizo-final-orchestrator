@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from axms_coding_orchestrator.coding_domain_client import _current_traceparent
 from axms_coding_orchestrator.observability import (
@@ -157,6 +162,7 @@ class ObservabilityTest(unittest.TestCase):
         self.assertFalse(invalid_host.enabled)
         self.assertTrue(enabled.enabled)
         self.assertFalse(failed.enabled)
+        tracer_provider = calls[0].pop("tracer_provider")
         self.assertEqual(
             [{
                 "public_key": "public-test",
@@ -166,6 +172,154 @@ class ObservabilityTest(unittest.TestCase):
             }],
             calls,
         )
+        self.assertEqual(
+            {"service.name": "axms-coding-orchestrator"},
+            dict(tracer_provider.resource.attributes),
+        )
+        enabled.close()
+
+    def test_provider_initialization_and_shutdown_fail_open(self) -> None:
+        factory_called = False
+
+        def factory(**_kwargs: object) -> _FakeClient:
+            nonlocal factory_called
+            factory_called = True
+            return _FakeClient()
+
+        settings = {
+            "LANGFUSE_PUBLIC_KEY": "public-provider-failure-test",
+            "LANGFUSE_SECRET_KEY": "private-provider-failure-test",
+            "LANGFUSE_BASE_URL": "https://jp.cloud.langfuse.com",
+        }
+        with patch(
+            "axms_coding_orchestrator.observability._closed_tracer_provider",
+            side_effect=RuntimeError("FORBIDDEN_PROVIDER_INIT_DETAIL"),
+        ):
+            disabled = AxmsObservability.from_environment(
+                settings, client_factory=factory
+            )
+        self.assertFalse(disabled.enabled)
+        self.assertFalse(factory_called)
+
+        class FailingProvider:
+            shutdown_called = False
+
+            def shutdown(self) -> None:
+                self.shutdown_called = True
+                raise RuntimeError("FORBIDDEN_PROVIDER_SHUTDOWN_DETAIL")
+
+        provider = FailingProvider()
+        client = _FakeClient()
+        observability = AxmsObservability(client, provider)
+        marker = object()
+        with observability.job(
+            job_id=JOB_ID,
+            trace_id=TRACE_ID,
+            profile_version_id=PROFILE_VERSION_ID,
+            attempt=1,
+        ):
+            result = observability.invoke_node(
+                node=SimpleNamespace(node_type="agent"),
+                invocation=_invocation(),
+                handler=lambda _invocation: marker,
+            )
+        observability.close()
+        self.assertIs(marker, result)
+        self.assertTrue(client.shutdown_called)
+        self.assertTrue(provider.shutdown_called)
+
+    def test_production_factory_ignores_ambient_and_global_otel_resources(self) -> None:
+        script = r'''
+import json
+from types import SimpleNamespace
+from langfuse import Langfuse
+from opentelemetry import trace
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from axms_coding_orchestrator.observability import AxmsObservability
+
+global_provider = TracerProvider(
+    resource=Resource({"axms.global": "FORBIDDEN_GLOBAL_RESOURCE"}),
+    shutdown_on_exit=False,
+)
+trace.set_tracer_provider(global_provider)
+exporter = InMemorySpanExporter()
+clients = []
+
+def factory(**kwargs):
+    client = Langfuse(**kwargs, span_exporter=exporter)
+    clients.append(client)
+    return client
+
+observability = AxmsObservability.from_environment(
+    {
+        "LANGFUSE_PUBLIC_KEY": "public-resource-subprocess-test",
+        "LANGFUSE_SECRET_KEY": "private-resource-subprocess-test",
+        "LANGFUSE_BASE_URL": "https://jp.cloud.langfuse.com",
+    },
+    client_factory=factory,
+)
+invocation = SimpleNamespace(
+    job_id="11111111-1111-4111-8111-111111111111",
+    trace_id="22222222-2222-4222-8222-222222222222",
+    profile_version_id="33333333-3333-4333-8333-333333333333",
+    node_id="resource-check",
+    execution_attempt=1,
+)
+with observability.job(
+    job_id=invocation.job_id,
+    trace_id=invocation.trace_id,
+    profile_version_id=invocation.profile_version_id,
+    attempt=1,
+):
+    observability.invoke_node(
+        node=SimpleNamespace(node_type="agent"),
+        invocation=invocation,
+        handler=lambda _invocation: SimpleNamespace(port="completed"),
+    )
+clients[0].flush()
+spans = exporter.get_finished_spans()
+payload = [{
+    "attributes": dict(span.attributes),
+    "events": [str(event) for event in span.events],
+    "resource": dict(span.resource.attributes),
+    "status": span.status.description,
+} for span in spans]
+observability.close()
+global_provider.shutdown()
+print(json.dumps(payload, sort_keys=True))
+'''
+        environment = dict(os.environ)
+        environment["OTEL_RESOURCE_ATTRIBUTES"] = (
+            "axms.secret=FORBIDDEN_ENV_SECRET,"
+            "axms.prompt=FORBIDDEN_ENV_PROMPT,"
+            "service.path=FORBIDDEN_ENV_PATH"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        spans = json.loads(completed.stdout)
+        self.assertEqual(2, len(spans))
+        for span in spans:
+            self.assertEqual(
+                {"service.name": "axms-coding-orchestrator"},
+                span["resource"],
+            )
+            self.assertEqual([], span["events"])
+            self.assertIsNone(span["status"])
+        serialized = json.dumps(spans, sort_keys=True)
+        for forbidden in (
+            "FORBIDDEN_ENV_SECRET",
+            "FORBIDDEN_ENV_PROMPT",
+            "FORBIDDEN_ENV_PATH",
+            "FORBIDDEN_GLOBAL_RESOURCE",
+        ):
+            self.assertNotIn(forbidden, serialized)
 
     def test_python_emits_payload_free_job_node_tool_and_check_only(self) -> None:
         client = _FakeClient()

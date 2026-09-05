@@ -66,7 +66,7 @@ class NaturalCmsSnapshotRunner:
             job_id=job.job_id,
             trace_id=job.trace_id,
             profile_version_id=job.profile_version_id,
-            attempt=job.state_version,
+            attempt=job.pipeline_attempt,
         ) as observation:
             result = self._invoke_resolved(reference, job)
             status = result.get("status")

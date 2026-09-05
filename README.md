@@ -124,7 +124,9 @@ raw errors are never sent. Python emits only payload-free Job, Node, Tool, and
 Check observations. While an `axms.node` observation is active, Spring-bound
 stage calls retain the business UUID `X-Trace-Id` and also inject its W3C
 `traceparent`; Spring owns the actual Provider `axms.model` observation on that
-same OpenTelemetry trace.
+same OpenTelemetry trace. Langfuse uses a runtime-owned OpenTelemetry provider
+with the fixed `service.name=axms-coding-orchestrator` Resource; ambient OTel
+Resource environment variables and an existing global provider are not reused.
 
 The Spring service token is read for every request and held in an erasable
 short-lived buffer. Secret contents, prompts, raw Tool results, remote error
@@ -170,8 +172,8 @@ bounded dependency failure/recovery checks.
 
 Latest verified Orchestrator evidence:
 
-- Python contract/runtime suite: 213 tests passed; 2 optional Valkey integration
-  tests skipped because `AXMS_TEST_VALKEY_PORT` was not configured.
+- Python contract/runtime suite: 217 total, 215 passed, and 2 optional Valkey
+  integration tests skipped because `AXMS_TEST_VALKEY_PORT` was not configured.
 - Syntax gate: 47 Python files parsed successfully.
 - The frozen `uv.lock` image built with Python 3.12.13 and ran as non-root UID
   10001.

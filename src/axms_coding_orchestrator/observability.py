@@ -43,6 +43,7 @@ ALLOWED_METADATA_KEYS = frozenset(
 )
 _ERROR_CODE = re.compile(r"^[A-Z][A-Z0-9_]{2,119}$")
 _FAILED_PORTS = frozenset({"failed", "blocked"})
+_OTEL_RESOURCE_ATTRIBUTES = {"service.name": "axms-coding-orchestrator"}
 
 
 class _JobScope:
@@ -64,10 +65,15 @@ class _JobScope:
 class AxmsObservability:
     """Manual SDK bridge that never forwards application payloads or failures."""
 
-    __slots__ = ("_client", "_current_job")
+    __slots__ = ("_client", "_tracer_provider", "_current_job")
 
-    def __init__(self, client: Any | None = None) -> None:
+    def __init__(
+        self,
+        client: Any | None = None,
+        tracer_provider: Any | None = None,
+    ) -> None:
         self._client = client
+        self._tracer_provider = tracer_provider
         self._current_job: ContextVar[Any | None] = ContextVar(
             "axms_langfuse_job", default=None
         )
@@ -82,7 +88,9 @@ class AxmsObservability:
         settings = LangfuseSettings.from_environment(source)
         if settings is None:
             return cls()
+        tracer_provider = None
         try:
+            tracer_provider = _closed_tracer_provider()
             if client_factory is None:
                 from langfuse import Langfuse
 
@@ -92,10 +100,12 @@ class AxmsObservability:
                 secret_key=settings.secret_key,
                 base_url=settings.base_url,
                 environment="local",
+                tracer_provider=tracer_provider,
             )
         except Exception:
+            _shutdown_provider(tracer_provider)
             return cls()
-        return cls(client)
+        return cls(client, tracer_provider)
 
     @property
     def enabled(self) -> bool:
@@ -222,13 +232,15 @@ class AxmsObservability:
 
     def close(self) -> None:
         client = self._client
+        tracer_provider = self._tracer_provider
         self._client = None
-        if client is None:
-            return
-        try:
-            client.shutdown()
-        except Exception:
-            pass
+        self._tracer_provider = None
+        if client is not None:
+            try:
+                client.shutdown()
+            except Exception:
+                pass
+        _shutdown_provider(tracer_provider)
 
     def _start_root(
         self, trace_id: str, metadata: Mapping[str, Any]
@@ -334,6 +346,25 @@ def _exit_manager(manager: Any | None) -> None:
         return
     try:
         manager.__exit__(None, None, None)
+    except Exception:
+        pass
+
+
+def _closed_tracer_provider() -> Any:
+    from opentelemetry.sdk.resources import Resource
+    from opentelemetry.sdk.trace import TracerProvider
+
+    return TracerProvider(
+        resource=Resource(_OTEL_RESOURCE_ATTRIBUTES),
+        shutdown_on_exit=False,
+    )
+
+
+def _shutdown_provider(tracer_provider: Any | None) -> None:
+    if tracer_provider is None:
+        return
+    try:
+        tracer_provider.shutdown()
     except Exception:
         pass
 

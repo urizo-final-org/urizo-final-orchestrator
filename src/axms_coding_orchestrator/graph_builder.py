@@ -152,45 +152,53 @@ def _node_action(
 ) -> Callable[[_SnapshotGraphState], dict[str, Any]]:
     def run(state: _SnapshotGraphState) -> dict[str, Any]:
         invocation = _invocation(snapshot, node, state)
+        validated: dict[str, Any] = {}
+
+        def handle_and_validate(current: NodeInvocation) -> NodeResult:
+            result = handler(current)
+            if not isinstance(result, NodeResult):
+                raise SnapshotGraphExecutionError(
+                    f"node '{node.node_id}' returned an invalid NodeResult"
+                )
+
+            if node.node_type == "end":
+                if result.port is not None:
+                    raise SnapshotGraphExecutionError(
+                        f"end node '{node.node_id}' returned a result port"
+                    )
+            elif result.port not in node.result_ports:
+                port = "TERMINAL" if result.port is None else result.port
+                raise SnapshotGraphExecutionError(
+                    f"node '{node.node_id}' returned undeclared port '{port}'"
+                )
+
+            counts = _loop_counts(state.get("_snapshotLoopCounts"), limits)
+            if result.port is not None:
+                target = routes[(node.node_id, result.port)]
+                route_key = _route_key(node.node_id, result.port, target)
+                maximum = limits.get(route_key)
+                if maximum is not None:
+                    count = counts.get(route_key, 0) + 1
+                    if count > maximum:
+                        raise SnapshotGraphExecutionError(
+                            f"node '{node.node_id}' exceeded its bounded loop"
+                        )
+                    counts[route_key] = count
+
+            context = current.context
+            context.update(result.updates)
+            validated["context"] = context
+            validated["counts"] = counts
+            return result
+
         result = observability.invoke_node(
             node=node,
             invocation=invocation,
-            handler=handler,
+            handler=handle_and_validate,
         )
-        if not isinstance(result, NodeResult):
-            raise SnapshotGraphExecutionError(
-                f"node '{node.node_id}' returned an invalid NodeResult"
-            )
-
-        if node.node_type == "end":
-            if result.port is not None:
-                raise SnapshotGraphExecutionError(
-                    f"end node '{node.node_id}' returned a result port"
-                )
-        elif result.port not in node.result_ports:
-            port = "TERMINAL" if result.port is None else result.port
-            raise SnapshotGraphExecutionError(
-                f"node '{node.node_id}' returned undeclared port '{port}'"
-            )
-
-        counts = _loop_counts(state.get("_snapshotLoopCounts"), limits)
-        if result.port is not None:
-            target = routes[(node.node_id, result.port)]
-            route_key = _route_key(node.node_id, result.port, target)
-            maximum = limits.get(route_key)
-            if maximum is not None:
-                count = counts.get(route_key, 0) + 1
-                if count > maximum:
-                    raise SnapshotGraphExecutionError(
-                        f"node '{node.node_id}' exceeded its bounded loop"
-                    )
-                counts[route_key] = count
-
-        context = invocation.context
-        context.update(result.updates)
         return {
-            "context": context,
-            "_snapshotLoopCounts": counts,
+            "context": validated["context"],
+            "_snapshotLoopCounts": validated["counts"],
             "_snapshotLastNodeId": node.node_id,
             "_snapshotLastResultPort": result.port,
         }
