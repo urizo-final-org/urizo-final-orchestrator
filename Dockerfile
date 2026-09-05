@@ -17,7 +17,16 @@ WORKDIR /app
 COPY --from=uv /uv /usr/local/bin/uv
 COPY pyproject.toml uv.lock README.md ./
 ARG UV_INSECURE_HOST=""
-RUN uv sync --frozen --no-dev --no-install-project
+RUN --mount=type=secret,id=python_build_extra_ca,required=false \
+    set -eu; \
+    if [ -f /run/secrets/python_build_extra_ca ]; then \
+        python_build_ca_bundle="$(mktemp)"; \
+        trap 'rm -f "$python_build_ca_bundle"' 0; \
+        cat /etc/ssl/certs/ca-certificates.crt \
+            /run/secrets/python_build_extra_ca > "$python_build_ca_bundle"; \
+        export SSL_CERT_FILE="$python_build_ca_bundle"; \
+    fi; \
+    uv sync --frozen --no-dev --no-install-project
 
 COPY src ./src
 
