@@ -14,6 +14,7 @@ from .node_runtime import (
     NodeRegistryViolation,
     NodeResult,
 )
+from .observability import AxmsObservability
 from .snapshot import SnapshotNode, VersionedSnapshot
 
 
@@ -50,12 +51,17 @@ class _SnapshotGraphState(TypedDict, total=False):
 class SnapshotGraphBuilder:
     """Build one in-memory LangGraph without changing the current Coding runner."""
 
-    __slots__ = ("_registry",)
+    __slots__ = ("_registry", "_observability")
 
-    def __init__(self, registry: NodeRegistry) -> None:
+    def __init__(
+        self,
+        registry: NodeRegistry,
+        observability: AxmsObservability | None = None,
+    ) -> None:
         if not isinstance(registry, NodeRegistry):
             raise TypeError("registry must be a NodeRegistry")
         self._registry = registry
+        self._observability = observability or AxmsObservability()
 
     def compile(self, snapshot: VersionedSnapshot, checkpointer: Any = None) -> Any:
         if not isinstance(snapshot, VersionedSnapshot):
@@ -110,6 +116,7 @@ class SnapshotGraphBuilder:
                     handlers[node.node_id],
                     routes,
                     limits,
+                    self._observability,
                 ),
             )
 
@@ -141,10 +148,15 @@ def _node_action(
     handler: NodeHandler,
     routes: Mapping[tuple[str, str], str],
     limits: Mapping[str, int],
+    observability: AxmsObservability,
 ) -> Callable[[_SnapshotGraphState], dict[str, Any]]:
     def run(state: _SnapshotGraphState) -> dict[str, Any]:
         invocation = _invocation(snapshot, node, state)
-        result = handler(invocation)
+        result = observability.invoke_node(
+            node=node,
+            invocation=invocation,
+            handler=handler,
+        )
         if not isinstance(result, NodeResult):
             raise SnapshotGraphExecutionError(
                 f"node '{node.node_id}' returned an invalid NodeResult"

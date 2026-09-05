@@ -20,6 +20,11 @@ from .model_gateway import (
     _request_http,
 )
 from .node_runtime import NodeInvocation
+from .observability import (
+    AxmsObservability,
+    ModelObservation,
+    parse_model_observations,
+)
 from .snapshot import HANDLER_KEY
 
 
@@ -142,6 +147,7 @@ class NaturalCmsStageResult:
     preview_id: str | None
     preview_hash: str | None
     payload: Mapping[str, Any]
+    model_observations: tuple[ModelObservation, ...] = ()
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "NaturalCmsStageResult":
@@ -150,7 +156,7 @@ class NaturalCmsStageResult:
             "schemaVersion", "resultId", "handlerKey", "resultPort", "resource", "payload"
         }
         allowed = required | {
-            "structuredCommand", "previewId", "previewHash"
+            "structuredCommand", "previewId", "previewHash", "modelObservations"
         }
         if (
             not required.issubset(data)
@@ -183,6 +189,7 @@ class NaturalCmsStageResult:
             preview_id,
             preview_hash,
             _object(data["payload"], "stage.payload"),
+            parse_model_observations(data.get("modelObservations")),
         )
 
 
@@ -197,7 +204,12 @@ class NaturalCmsDomainClient(Protocol):
 
 
 class SpringNaturalCmsDomainClient:
-    __slots__ = ("_origin", "_credential_resolver", "_timeout_seconds")
+    __slots__ = (
+        "_origin",
+        "_credential_resolver",
+        "_timeout_seconds",
+        "_observability",
+    )
 
     def __init__(
         self,
@@ -206,6 +218,7 @@ class SpringNaturalCmsDomainClient:
         *,
         timeout_seconds: float = 10.0,
         allowed_origins: set[str] | frozenset[str] | None = None,
+        observability: AxmsObservability | None = None,
     ) -> None:
         origins = frozenset(
             {SPRING_PRIVATE_ORIGIN} if allowed_origins is None else allowed_origins
@@ -224,6 +237,7 @@ class SpringNaturalCmsDomainClient:
         self._origin = spring_origin
         self._credential_resolver = credential_resolver
         self._timeout_seconds = float(timeout_seconds)
+        self._observability = observability or AxmsObservability()
 
     def resolve_job(self, job: QueuedJobReference) -> NaturalCmsJob:
         if not isinstance(job, QueuedJobReference):
@@ -285,6 +299,7 @@ class SpringNaturalCmsDomainClient:
             raise _invalid_response() from None
         if result.result_id != result_id or result.handler_key != handler_key:
             raise _invalid_response()
+        self._observability.record_models(result.model_observations)
         return result
 
     def _call(

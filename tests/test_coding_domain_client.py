@@ -169,6 +169,22 @@ def _stage_execution_response() -> dict[str, object]:
         "diffDigest": DIGEST,
         "validationHash": DIGEST,
         "payload": {"status": "READY"},
+        "modelObservations": [
+            {
+                "provider": "OPENAI",
+                "modelId": "gpt-final",
+                "inputTokens": 101,
+                "outputTokens": 29,
+                "latencyMs": 450,
+            },
+            {
+                "provider": "ANTHROPIC",
+                "modelId": "claude-final",
+                "inputTokens": 203,
+                "outputTokens": 41,
+                "latencyMs": 780,
+            },
+        ],
     }
 
 
@@ -305,9 +321,18 @@ class SpringCodingDomainClientTest(unittest.TestCase):
         self.assertEqual("ready", _CodingHandler.observed_body["resultPort"])
 
     def test_execute_stage_posts_the_exact_authoritative_invocation(self) -> None:
+        observed_models: list[object] = []
+
+        class ObservationSink:
+            def record_models(self, values: object) -> None:
+                observed_models.extend(values)  # type: ignore[arg-type]
+
         with _coding_server(_stage_execution_response()) as origin:
             client = SpringCodingDomainClient(
-                origin, self._credential, allowed_origins={origin}
+                origin,
+                self._credential,
+                allowed_origins={origin},
+                observability=ObservationSink(),  # type: ignore[arg-type]
             )
             result = client.execute_stage(
                 _invocation(), "coding.preview", RESULT_ID
@@ -315,6 +340,12 @@ class SpringCodingDomainClientTest(unittest.TestCase):
 
         self.assertIsInstance(result, CodingStageExecutionResult)
         self.assertEqual("ready", result.result_port)
+        self.assertEqual(2, len(result.model_observations))
+        self.assertEqual("gpt-final", result.model_observations[0].model)
+        self.assertEqual(101, result.model_observations[0].input_tokens)
+        self.assertEqual("claude-final", result.model_observations[1].model)
+        self.assertEqual(780, result.model_observations[1].latency_ms)
+        self.assertEqual(list(result.model_observations), observed_models)
         self.assertEqual(
             f"/internal/coding/worker/jobs/{JOB_ID}/attempts/2/stages/"
             f"coding.preview/executions/{RESULT_ID}",

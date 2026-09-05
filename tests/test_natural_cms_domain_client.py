@@ -116,8 +116,22 @@ class SpringNaturalCmsDomainClientTest(unittest.TestCase):
             "resultPort": "ready",
             "resource": {"type": "CONTENT", "id": "7"},
             "payload": {"status": "READY"},
+            "modelObservations": [
+                {
+                    "provider": "GOOGLE_GENAI",
+                    "modelId": "gemini-final",
+                    "inputTokens": 87,
+                    "outputTokens": 16,
+                    "latencyMs": 320,
+                }
+            ],
         }
         observed: dict[str, object] = {}
+        observed_models: list[object] = []
+
+        class ObservationSink:
+            def record_models(self, values: object) -> None:
+                observed_models.extend(values)  # type: ignore[arg-type]
 
         def request_http(
             method: str,
@@ -141,6 +155,7 @@ class SpringNaturalCmsDomainClientTest(unittest.TestCase):
             "http://127.0.0.1:18080",
             lambda: ServiceCredentialLease(b"spring-service-test-token"),
             allowed_origins={"http://127.0.0.1:18080"},
+            observability=ObservationSink(),  # type: ignore[arg-type]
         )
         with patch(
             "axms_coding_orchestrator.natural_cms_domain_client._request_coding_http",
@@ -149,6 +164,13 @@ class SpringNaturalCmsDomainClientTest(unittest.TestCase):
             result = client.execute_stage(invocation, "cms.preview", RESULT_ID)
 
         self.assertIsInstance(result, NaturalCmsStageResult)
+        self.assertEqual(1, len(result.model_observations))
+        self.assertEqual("GOOGLE_GENAI", result.model_observations[0].provider)
+        self.assertEqual("gemini-final", result.model_observations[0].model)
+        self.assertEqual(87, result.model_observations[0].input_tokens)
+        self.assertEqual(16, result.model_observations[0].output_tokens)
+        self.assertEqual(320, result.model_observations[0].latency_ms)
+        self.assertEqual(list(result.model_observations), observed_models)
         self.assertEqual(
             {
                 "schemaVersion": "1.0",
@@ -164,6 +186,19 @@ class SpringNaturalCmsDomainClientTest(unittest.TestCase):
         )
         self.assertEqual(b"spring-service-test-token", observed["credential"])
         self.assertEqual(TRACE_ID, observed["trace_id"])
+
+    def test_replay_or_legacy_stage_without_model_turns_has_no_observation(self) -> None:
+        base = {
+            "schemaVersion": "1.0",
+            "resultId": RESULT_ID,
+            "handlerKey": "cms.preview",
+            "resultPort": "ready",
+            "resource": {"type": "CONTENT", "id": "7"},
+            "payload": {"status": "READY"},
+        }
+        self.assertEqual((), NaturalCmsStageResult.from_dict(base).model_observations)
+        base["modelObservations"] = []
+        self.assertEqual((), NaturalCmsStageResult.from_dict(base).model_observations)
 
 
 if __name__ == "__main__":

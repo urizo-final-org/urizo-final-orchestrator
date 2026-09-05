@@ -46,6 +46,7 @@ from .natural_cms_handlers import (
     register_natural_cms_node_handlers,
 )
 from .natural_cms_runner import NaturalCmsSnapshotRunner
+from .observability import AxmsObservability
 from .profile_version_client import ProfileVersionClient, ProfileVersionClientError
 from .queue import QueueError, ValkeyJobQueue
 from .snapshot_runner import (
@@ -209,6 +210,7 @@ class WorkerLoop:
         max_attempts: int,
         max_backoff_seconds: int,
         sleeper: Callable[[float], None] | None = None,
+        observability: AxmsObservability | None = None,
     ) -> None:
         self._queue = queue
         self._worker_api = worker_api
@@ -219,6 +221,7 @@ class WorkerLoop:
         self._max_attempts = max_attempts
         self._max_backoff_seconds = max_backoff_seconds
         self._sleep = sleeper or time.sleep
+        self._observability = observability or AxmsObservability()
         self._stop = threading.Event()
 
     def stop(self) -> None:
@@ -267,7 +270,17 @@ class WorkerLoop:
                 return True
             claim = self._claim_with_backoff(event)
             self._heartbeat.start(claim)
-            result = self._graph.invoke(event, claim)
+            with self._observability.job(
+                job_id=event.job_id,
+                trace_id=claim.trace_id,
+                profile_version_id=event.profile_version_id,
+                attempt=event.execution_attempt or 1,
+            ) as observation:
+                result = self._graph.invoke(event, claim)
+                if isinstance(result, Mapping) and isinstance(
+                    result.get("status"), str
+                ):
+                    observation.finish(result["status"])
             if event.is_profile_bound and not self._report_success(claim, result):
                 return False
             self._health.update(last_error_code=None)
@@ -529,10 +542,12 @@ def main() -> None:
     heartbeat: LeaseHeartbeatManager | None = None
     coding_loop: WorkerLoop | None = None
     natural_cms_loop: NaturalCmsWorkerLoop | None = None
+    observability: AxmsObservability | None = None
     worker_threads: list[threading.Thread] = []
     shutdown = threading.Event()
     try:
         settings = RuntimeSettings.from_environment()
+        observability = AxmsObservability.from_environment()
         server = HealthServer(settings.health_host, settings.health_port, health)
         server.start()
         checkpoint = CheckpointRuntime(
@@ -592,6 +607,7 @@ def main() -> None:
             settings.spring_origin,
             credential_resolver,
             timeout_seconds=180.0,
+            observability=observability,
         )
         coding_registry = register_coding_node_handlers(
             build_common_node_registry(),
@@ -603,6 +619,7 @@ def main() -> None:
         natural_cms_domain_client = SpringNaturalCmsDomainClient(
             settings.spring_origin,
             credential_resolver,
+            observability=observability,
         )
         natural_cms_registry = register_natural_cms_node_handlers(
             build_common_node_registry(),
@@ -621,6 +638,7 @@ def main() -> None:
             SpringSnapshotExecutionProvider(profile_versions),
             coding_registry,
             checkpoint.checkpointer,
+            observability,
         )
         graph = ProfileBoundWorkerGraphRouter(legacy_graph, snapshot_graph)
         coding_loop = WorkerLoop(
@@ -632,6 +650,7 @@ def main() -> None:
             queue_block_seconds=settings.queue_block_seconds,
             max_attempts=settings.max_attempts,
             max_backoff_seconds=settings.max_backoff_seconds,
+            observability=observability,
         )
         natural_cms_loop = NaturalCmsWorkerLoop(
             natural_cms_queue,
@@ -640,6 +659,7 @@ def main() -> None:
                 profile_versions,
                 natural_cms_registry,
                 checkpoint.checkpointer,
+                observability,
             ),
             health,
             queue_block_seconds=settings.queue_block_seconds,
@@ -709,6 +729,8 @@ def main() -> None:
                 thread.join(timeout=15)
         if heartbeat is not None:
             heartbeat.close()
+        if observability is not None:
+            observability.close()
         if natural_cms_queue is not None:
             natural_cms_queue.close()
         if coding_queue is not None:

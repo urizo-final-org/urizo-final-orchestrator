@@ -24,6 +24,11 @@ from .model_gateway import (
     _read_chunked,
 )
 from .node_runtime import NodeInvocation
+from .observability import (
+    AxmsObservability,
+    ModelObservation,
+    parse_model_observations,
+)
 from .snapshot import HANDLER_KEY, NODE_IDENTIFIER
 
 
@@ -145,6 +150,7 @@ class CodingStageExecutionResult:
     candidate_sha: str | None = None
     diff_digest: str | None = None
     validation_hash: str | None = None
+    model_observations: tuple[ModelObservation, ...] = ()
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> CodingStageExecutionResult:
@@ -156,7 +162,13 @@ class CodingStageExecutionResult:
             "resultPort",
             "payload",
         }
-        optional = {"workspaceId", "candidateSha", "diffDigest", "validationHash"}
+        optional = {
+            "workspaceId",
+            "candidateSha",
+            "diffDigest",
+            "validationHash",
+            "modelObservations",
+        }
         _fields(payload, required, optional, "stageExecution")
         if payload["schemaVersion"] != "1.0":
             raise ValueError("stageExecution.schemaVersion is invalid")
@@ -189,6 +201,9 @@ class CodingStageExecutionResult:
                 SHA256_DIGEST,
                 "stageExecution.validationHash",
                 71,
+            ),
+            model_observations=parse_model_observations(
+                payload.get("modelObservations")
             ),
         )
 
@@ -483,7 +498,12 @@ class CodingDomainClient(Protocol):
 class SpringCodingDomainClient:
     """Read and atomically record only the current Spring Coding attempt."""
 
-    __slots__ = ("_origin", "_credential_resolver", "_timeout_seconds")
+    __slots__ = (
+        "_origin",
+        "_credential_resolver",
+        "_timeout_seconds",
+        "_observability",
+    )
 
     def __init__(
         self,
@@ -492,6 +512,7 @@ class SpringCodingDomainClient:
         *,
         timeout_seconds: float = 10.0,
         allowed_origins: set[str] | frozenset[str] | None = None,
+        observability: AxmsObservability | None = None,
     ) -> None:
         origins = frozenset(
             {SPRING_PRIVATE_ORIGIN} if allowed_origins is None else allowed_origins
@@ -510,6 +531,7 @@ class SpringCodingDomainClient:
         self._origin = spring_origin
         self._credential_resolver = credential_resolver
         self._timeout_seconds = float(timeout_seconds)
+        self._observability = observability or AxmsObservability()
 
     def get_attempt(self, invocation: NodeInvocation) -> CodingAttemptAggregate:
         _invocation(invocation)
@@ -599,6 +621,7 @@ class SpringCodingDomainClient:
             or stage_result.handler_key != handler_key
         ):
             raise _invalid_response()
+        self._observability.record_models(stage_result.model_observations)
         return stage_result
 
     def _call(

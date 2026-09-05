@@ -106,6 +106,28 @@ AXMS_HEALTH_PORT=8090
 LANGGRAPH_STRICT_MSGPACK=true
 ```
 
+Optional Langfuse Cloud observability is enabled only when all three values are
+present and the Japan endpoint matches exactly:
+
+```text
+LANGFUSE_PUBLIC_KEY=<environment-provided>
+LANGFUSE_SECRET_KEY=<environment-provided>
+LANGFUSE_BASE_URL=https://jp.cloud.langfuse.com
+```
+
+Missing, partial, invalid, or unavailable Langfuse configuration leaves
+observability disabled. Trace creation and background export are fail-open and
+never change a Job result. Only fixed `axms.job`, `axms.node`, `axms.model`,
+`axms.tool`, and `axms.check` names are permitted with closed operational
+metadata; prompts, completions, Source, Diff, Tool I/O, full State, secrets, and
+raw errors are never sent. `axms.model` is emitted only when the Spring stage
+response supplies the actual selected provider/model, token usage, and model
+latency. Missing or empty model observations emit nothing rather than reporting
+configured bindings as actual execution data. Actual model and token counts also
+populate Langfuse's native generation fields without sending prompt or completion
+content; Backend `latencyMs` remains closed metadata and is not used to backdate
+the observation clock.
+
 The Spring service token is read for every request and held in an erasable
 short-lived buffer. Secret contents, prompts, raw Tool results, remote error
 bodies, and credential digests are never logged.

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
 from typing import Mapping
@@ -26,6 +26,36 @@ FORBIDDEN_AUTHORITY_ENV = frozenset(
         "AXMS_CORE_DB_PASSWORD_FILE",
     }
 )
+
+LANGFUSE_JAPAN_BASE_URL = "https://jp.cloud.langfuse.com"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class LangfuseSettings:
+    """Environment-only Langfuse credentials with a value-free representation."""
+
+    public_key: str = field(repr=False)
+    secret_key: str = field(repr=False)
+    base_url: str
+
+    @classmethod
+    def from_environment(
+        cls, source: Mapping[str, str] | None = None
+    ) -> LangfuseSettings | None:
+        values = os.environ if source is None else source
+        public_key = values.get("LANGFUSE_PUBLIC_KEY")
+        secret_key = values.get("LANGFUSE_SECRET_KEY")
+        base_url = values.get("LANGFUSE_BASE_URL")
+        if not public_key or not secret_key or base_url != LANGFUSE_JAPAN_BASE_URL:
+            return None
+        return cls(
+            public_key=public_key,
+            secret_key=secret_key,
+            base_url=base_url,
+        )
+
+    def __repr__(self) -> str:
+        return "LangfuseSettings[enabled=True, baseUrl=%s]" % self.base_url
 
 
 def _integer(
