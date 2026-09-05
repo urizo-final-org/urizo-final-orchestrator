@@ -19,14 +19,26 @@ COPY pyproject.toml uv.lock README.md ./
 ARG UV_INSECURE_HOST=""
 RUN --mount=type=secret,id=python_build_extra_ca,required=false \
     set -eu; \
+    python_runtime_ca_bundle=/etc/ssl/certs/axms-python-runtime-ca-bundle.pem; \
     if [ -f /run/secrets/python_build_extra_ca ]; then \
         python_build_ca_bundle="$(mktemp)"; \
         trap 'rm -f "$python_build_ca_bundle"' 0; \
+        if grep -Eq -- '-----BEGIN ([A-Z0-9]+ )*PRIVATE KEY-----' \
+            /run/secrets/python_build_extra_ca; then exit 1; fi; \
+        grep -q -- '-----BEGIN CERTIFICATE-----' \
+            /run/secrets/python_build_extra_ca; \
         cat /etc/ssl/certs/ca-certificates.crt \
             /run/secrets/python_build_extra_ca > "$python_build_ca_bundle"; \
+        install -m 0644 "$python_build_ca_bundle" "$python_runtime_ca_bundle"; \
         export SSL_CERT_FILE="$python_build_ca_bundle"; \
+    else \
+        install -m 0644 /etc/ssl/certs/ca-certificates.crt \
+            "$python_runtime_ca_bundle"; \
     fi; \
     uv sync --frozen --no-dev --no-install-project
+
+ENV SSL_CERT_FILE="/etc/ssl/certs/axms-python-runtime-ca-bundle.pem" \
+    REQUESTS_CA_BUNDLE="/etc/ssl/certs/axms-python-runtime-ca-bundle.pem"
 
 COPY src ./src
 
