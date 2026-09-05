@@ -3,17 +3,29 @@ from __future__ import annotations
 from types import SimpleNamespace
 import unittest
 
+from axms_coding_orchestrator.coding_domain_client import _current_traceparent
 from axms_coding_orchestrator.observability import (
     ALLOWED_METADATA_KEYS,
     AxmsObservability,
-    ModelObservation,
-    parse_model_observations,
 )
 
 
 JOB_ID = "11111111-1111-4111-8111-111111111111"
 TRACE_ID = "22222222-2222-4222-8222-222222222222"
 PROFILE_VERSION_ID = "33333333-3333-4333-8333-333333333333"
+
+
+class _FakeManager:
+    def __init__(self, observation: _FakeObservation, *, auto_end: bool) -> None:
+        self.observation = observation
+        self.auto_end = auto_end
+
+    def __enter__(self) -> _FakeObservation:
+        return self.observation
+
+    def __exit__(self, *_args: object) -> None:
+        if self.auto_end:
+            self.observation.end()
 
 
 class _FakeObservation:
@@ -25,6 +37,9 @@ class _FakeObservation:
 
     def start_observation(self, **kwargs: object) -> _FakeObservation:
         return self.client._start(**kwargs)
+
+    def start_as_current_observation(self, **kwargs: object) -> _FakeManager:
+        return _FakeManager(self.client._start(**kwargs), auto_end=True)
 
     def update(self, **kwargs: object) -> None:
         if self.client.fail_update:
@@ -60,8 +75,9 @@ class _FakeClient:
         self.seed = seed
         return "a" * 32
 
-    def start_observation(self, **kwargs: object) -> _FakeObservation:
-        return self._start(**kwargs)
+    def start_as_current_observation(self, **kwargs: object) -> _FakeManager:
+        end_on_exit = bool(kwargs.pop("end_on_exit", True))
+        return _FakeManager(self._start(**kwargs), auto_end=end_on_exit)
 
     def _start(self, **kwargs: object) -> _FakeObservation:
         if self.fail_start:
@@ -98,29 +114,6 @@ def _invocation(node_id: str = "analyze") -> SimpleNamespace:
 
 
 class ObservabilityTest(unittest.TestCase):
-    def test_model_provider_allowlist_matches_backend_enum_exactly(self) -> None:
-        def value(provider: str) -> dict[str, object]:
-            return {
-                "provider": provider,
-                "modelId": "model-final",
-                "inputTokens": 1,
-                "outputTokens": 2,
-                "latencyMs": 3,
-            }
-
-        accepted = parse_model_observations(
-            [value("GOOGLE_GENAI"), value("VERTEX_AI_GEMINI")]
-        )
-        rejected = parse_model_observations(
-            [value("GOOGLE"), value("LOCAL"), value("UNKNOWN")]
-        )
-
-        self.assertEqual(
-            ["GOOGLE_GENAI", "VERTEX_AI_GEMINI"],
-            [observation.provider for observation in accepted],
-        )
-        self.assertEqual((), rejected)
-
     def test_environment_activation_is_exact_and_initialization_is_fail_open(self) -> None:
         calls: list[dict[str, object]] = []
 
@@ -165,145 +158,24 @@ class ObservabilityTest(unittest.TestCase):
         self.assertTrue(enabled.enabled)
         self.assertFalse(failed.enabled)
         self.assertEqual(
-            [
-                {
-                    "public_key": "public-test",
-                    "secret_key": "secret-test",
-                    "base_url": "https://jp.cloud.langfuse.com",
-                    "environment": "local",
-                }
-            ],
+            [{
+                "public_key": "public-test",
+                "secret_key": "secret-test",
+                "base_url": "https://jp.cloud.langfuse.com",
+                "environment": "local",
+            }],
             calls,
         )
 
-    def test_configured_model_binding_is_not_reported_as_actual_execution(self) -> None:
+    def test_python_emits_payload_free_job_node_tool_and_check_only(self) -> None:
         client = _FakeClient()
         observability = AxmsObservability(client)
-        node = SimpleNamespace(node_type="agent")
-        result = SimpleNamespace(port="completed")
-
         with observability.job(
             job_id=JOB_ID,
             trace_id=TRACE_ID,
             profile_version_id=PROFILE_VERSION_ID,
             attempt=2,
         ) as job:
-            actual = observability.invoke_node(
-                node=node,
-                invocation=_invocation(),
-                handler=lambda _invocation: result,
-            )
-            job.finish("COMPLETED")
-
-        self.assertIs(result, actual)
-        self.assertEqual(
-            ["axms.job", "axms.node"],
-            [observation.name for observation in client.observations],
-        )
-        self.assertEqual(TRACE_ID, client.seed)
-        self.assertNotIn("provider", client.observations[1].metadata)
-        self.assertNotIn("model", client.observations[1].metadata)
-        for arguments in client.start_arguments:
-            self.assertNotIn("input", arguments)
-            self.assertNotIn("output", arguments)
-        for observation in client.observations:
-            self.assertLessEqual(set(observation.metadata), ALLOWED_METADATA_KEYS)
-        serialized = repr(client.start_arguments) + repr(
-            [observation.metadata for observation in client.observations]
-        )
-        for forbidden in (
-            "FORBIDDEN_PROMPT",
-            "FORBIDDEN_SOURCE",
-            "FORBIDDEN_TOOL_OUTPUT",
-        ):
-            self.assertNotIn(forbidden, serialized)
-
-    def test_actual_model_values_emit_one_observation_per_backend_turn(self) -> None:
-        client = _FakeClient()
-        observability = AxmsObservability(client)
-        turns = (
-            ModelObservation("OPENAI", "gpt-final", 101, 29, 450),
-            ModelObservation("ANTHROPIC", "claude-final", 203, 41, 780),
-        )
-
-        def handler(_invocation: object) -> SimpleNamespace:
-            observability.record_models(turns)
-            return SimpleNamespace(port="completed")
-
-        with observability.job(
-            job_id=JOB_ID,
-            trace_id=TRACE_ID,
-            profile_version_id=PROFILE_VERSION_ID,
-            attempt=1,
-        ):
-            observability.invoke_node(
-                node=SimpleNamespace(node_type="agent"),
-                invocation=_invocation(),
-                handler=handler,
-            )
-
-        self.assertEqual(
-            ["axms.job", "axms.node", "axms.model", "axms.model"],
-            [observation.name for observation in client.observations],
-        )
-        self.assertEqual(
-            {
-                "provider": "OPENAI",
-                "model": "gpt-final",
-                "inputTokens": 101,
-                "outputTokens": 29,
-                "latencyMs": 450,
-            },
-            client.observations[2].metadata,
-        )
-        self.assertEqual(
-            {
-                "provider": "ANTHROPIC",
-                "model": "claude-final",
-                "inputTokens": 203,
-                "outputTokens": 41,
-                "latencyMs": 780,
-            },
-            client.observations[3].metadata,
-        )
-        model_starts = [
-            arguments
-            for arguments in client.start_arguments
-            if arguments.get("name") == "axms.model"
-        ]
-        self.assertEqual(
-            [
-                {
-                    "model": "gpt-final",
-                    "usage_details": {"input": 101, "output": 29},
-                },
-                {
-                    "model": "claude-final",
-                    "usage_details": {"input": 203, "output": 41},
-                },
-            ],
-            [
-                {
-                    "model": arguments.get("model"),
-                    "usage_details": arguments.get("usage_details"),
-                }
-                for arguments in model_starts
-            ],
-        )
-        for arguments in model_starts:
-            self.assertNotIn("input", arguments)
-            self.assertNotIn("output", arguments)
-            self.assertNotIn("prompt", arguments)
-
-    def test_tool_and_check_statuses_use_only_fixed_observation_names(self) -> None:
-        client = _FakeClient()
-        observability = AxmsObservability(client)
-        with observability.job(
-            job_id=JOB_ID,
-            trace_id=TRACE_ID,
-            profile_version_id=PROFILE_VERSION_ID,
-            attempt=1,
-        ):
             observability.invoke_node(
                 node=SimpleNamespace(node_type="tool"),
                 invocation=_invocation("preview"),
@@ -314,6 +186,7 @@ class ObservabilityTest(unittest.TestCase):
                 invocation=_invocation("check"),
                 handler=lambda _invocation: SimpleNamespace(port="passed"),
             )
+            job.finish("COMPLETED")
 
         self.assertEqual(
             ["axms.job", "axms.node", "axms.tool", "axms.node", "axms.check"],
@@ -321,6 +194,22 @@ class ObservabilityTest(unittest.TestCase):
         )
         self.assertEqual("FAILED", client.observations[2].metadata["toolStatus"])
         self.assertEqual("PASSED", client.observations[4].metadata["checkStatus"])
+        for arguments in client.start_arguments:
+            self.assertNotIn("input", arguments)
+            self.assertNotIn("output", arguments)
+            self.assertNotIn("prompt", arguments)
+        for observation in client.observations:
+            self.assertLessEqual(set(observation.metadata), ALLOWED_METADATA_KEYS)
+        serialized = repr(client.start_arguments) + repr(
+            [observation.metadata for observation in client.observations]
+        )
+        for forbidden in (
+            "FORBIDDEN_PROMPT",
+            "FORBIDDEN_SOURCE",
+            "FORBIDDEN_TOOL_OUTPUT",
+            "axms.model",
+        ):
+            self.assertNotIn(forbidden, serialized)
 
     def test_raw_failure_is_not_exported_and_original_failure_is_preserved(self) -> None:
         class ExpectedFailure(RuntimeError):
@@ -328,7 +217,6 @@ class ObservabilityTest(unittest.TestCase):
 
         client = _FakeClient()
         observability = AxmsObservability(client)
-
         with self.assertRaisesRegex(ExpectedFailure, "FORBIDDEN_RAW_ERROR"):
             with observability.job(
                 job_id=JOB_ID,
@@ -376,7 +264,7 @@ class ObservabilityTest(unittest.TestCase):
         AxmsObservability(shutdown_client).close()
         self.assertTrue(shutdown_client.shutdown_called)
 
-    def test_actual_sdk_exports_only_fixed_names_without_application_io(self) -> None:
+    def test_actual_sdk_exports_closed_spans_and_active_node_traceparent(self) -> None:
         from langfuse import Langfuse
         from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
             InMemorySpanExporter,
@@ -384,13 +272,14 @@ class ObservabilityTest(unittest.TestCase):
 
         exporter = InMemorySpanExporter()
         client = Langfuse(
-            public_key="pk-lf-unit-test",
-            secret_key="sk-lf-unit-test",
+            public_key="pk-lf-traceparent-test",
+            secret_key="test-private-traceparent-value",
             base_url="https://jp.cloud.langfuse.com",
             environment="local",
             span_exporter=exporter,
         )
         observability = AxmsObservability(client)
+        captured: dict[str, str | None] = {}
         with observability.job(
             job_id=JOB_ID,
             trace_id=TRACE_ID,
@@ -398,43 +287,96 @@ class ObservabilityTest(unittest.TestCase):
             attempt=1,
         ):
             observability.invoke_node(
+                node=SimpleNamespace(node_type="tool"),
+                invocation=_invocation("tool"),
+                handler=lambda _invocation: (
+                    captured.update(traceparent=_current_traceparent()),
+                    SimpleNamespace(port="completed"),
+                )[1],
+            )
+            observability.invoke_node(
                 node=SimpleNamespace(node_type="check"),
                 invocation=_invocation("check"),
                 handler=lambda _invocation: SimpleNamespace(port="passed"),
             )
-            observability.invoke_node(
-                node=SimpleNamespace(node_type="agent"),
-                invocation=_invocation("analyze"),
-                handler=lambda _invocation: (
-                    observability.record_models(
-                        (ModelObservation("OPENAI", "gpt-final", 101, 29, 450),)
-                    ),
-                    SimpleNamespace(port="completed"),
-                )[1],
-            )
         client.flush()
         spans = exporter.get_finished_spans()
-        serialized_attributes = repr([span.attributes for span in spans])
 
         self.assertEqual(
-            {"axms.job", "axms.node", "axms.model", "axms.check"},
+            {"axms.job", "axms.node", "axms.tool", "axms.check"},
             {span.name for span in spans},
         )
-        model_span = next(span for span in spans if span.name == "axms.model")
-        self.assertEqual(
-            "gpt-final",
-            model_span.attributes["langfuse.observation.model.name"],
+        self.assertNotIn("axms.model", {span.name for span in spans})
+        traceparent = captured["traceparent"]
+        self.assertIsInstance(traceparent, str)
+        parts = str(traceparent).split("-")
+        tool_node = next(
+            span
+            for span in spans
+            if span.name == "axms.node"
+            and f"{span.get_span_context().span_id:016x}" == parts[2]
         )
-        self.assertEqual(
-            '{"input": 101, "output": 29}',
-            model_span.attributes["langfuse.observation.usage_details"],
+        context = tool_node.get_span_context()
+        self.assertEqual(f"{context.trace_id:032x}", parts[1])
+        self.assertEqual(f"{context.span_id:016x}", parts[2])
+
+        serialized = repr(
+            [{
+                "attributes": span.attributes,
+                "events": span.events,
+                "status": span.status.description,
+                "resource": span.resource.attributes,
+            } for span in spans]
         )
-        self.assertNotIn("FORBIDDEN_PROMPT", serialized_attributes)
-        self.assertNotIn("FORBIDDEN_SOURCE", serialized_attributes)
-        self.assertNotIn("FORBIDDEN_TOOL_OUTPUT", serialized_attributes)
-        self.assertNotIn("langfuse.observation.input", serialized_attributes)
-        self.assertNotIn("langfuse.observation.output", serialized_attributes)
-        self.assertNotIn("langfuse.observation.prompt", serialized_attributes)
+        for forbidden in (
+            "FORBIDDEN_PROMPT",
+            "FORBIDDEN_SOURCE",
+            "FORBIDDEN_TOOL_OUTPUT",
+            "langfuse.observation.input",
+            "langfuse.observation.output",
+            "langfuse.observation.prompt",
+        ):
+            self.assertNotIn(forbidden, serialized)
+        self.assertTrue(all(not span.events for span in spans))
+        observability.close()
+
+    def test_actual_sdk_does_not_record_raw_exception_event_or_status(self) -> None:
+        from langfuse import Langfuse
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+            InMemorySpanExporter,
+        )
+
+        exporter = InMemorySpanExporter()
+        client = Langfuse(
+            public_key="pk-lf-exception-test",
+            secret_key="test-private-exception-value",
+            base_url="https://jp.cloud.langfuse.com",
+            environment="local",
+            span_exporter=exporter,
+        )
+        observability = AxmsObservability(client)
+        with self.assertRaisesRegex(RuntimeError, "FORBIDDEN_RAW_ERROR"):
+            with observability.job(
+                job_id=JOB_ID,
+                trace_id=TRACE_ID,
+                profile_version_id=PROFILE_VERSION_ID,
+                attempt=1,
+            ):
+                observability.invoke_node(
+                    node=SimpleNamespace(node_type="agent"),
+                    invocation=_invocation(),
+                    handler=lambda _invocation: (_ for _ in ()).throw(
+                        RuntimeError("FORBIDDEN_RAW_ERROR")
+                    ),
+                )
+        client.flush()
+        spans = exporter.get_finished_spans()
+        serialized = repr(
+            [(span.attributes, span.events, span.status.description) for span in spans]
+        )
+        self.assertNotIn("FORBIDDEN_RAW_ERROR", serialized)
+        self.assertTrue(all(not span.events for span in spans))
+        self.assertTrue(all(span.status.description is None for span in spans))
         observability.close()
 
 

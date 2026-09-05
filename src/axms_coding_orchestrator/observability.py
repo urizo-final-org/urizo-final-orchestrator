@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
 from datetime import datetime, timezone
 import re
 import time
@@ -43,61 +42,7 @@ ALLOWED_METADATA_KEYS = frozenset(
     }
 )
 _ERROR_CODE = re.compile(r"^[A-Z][A-Z0-9_]{2,119}$")
-_MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$")
-_PROVIDERS = frozenset(
-    {"OPENAI", "ANTHROPIC", "GOOGLE_GENAI", "VERTEX_AI_GEMINI"}
-)
 _FAILED_PORTS = frozenset({"failed", "blocked"})
-
-
-@dataclass(frozen=True, slots=True)
-class ModelObservation:
-    """Payload-free facts from one actual successful Backend model response."""
-
-    provider: str
-    model: str
-    input_tokens: int
-    output_tokens: int
-    latency_ms: int
-
-
-def parse_model_observations(value: Any) -> tuple[ModelObservation, ...]:
-    """Keep only closed, bounded model facts; malformed telemetry stays fail-open."""
-
-    if not isinstance(value, list) or len(value) > 100:
-        return ()
-    parsed: list[ModelObservation] = []
-    expected = {
-        "provider",
-        "modelId",
-        "inputTokens",
-        "outputTokens",
-        "latencyMs",
-    }
-    for item in value:
-        if not isinstance(item, Mapping) or set(item) != expected:
-            continue
-        provider = item.get("provider")
-        model = item.get("modelId")
-        counts = (
-            item.get("inputTokens"),
-            item.get("outputTokens"),
-            item.get("latencyMs"),
-        )
-        if (
-            provider not in _PROVIDERS
-            or not isinstance(model, str)
-            or _MODEL_ID.fullmatch(model) is None
-            or any(
-                isinstance(count, bool)
-                or not isinstance(count, int)
-                or count < 0
-                for count in counts
-            )
-        ):
-            continue
-        parsed.append(ModelObservation(provider, model, *counts))
-    return tuple(parsed)
 
 
 class _JobScope:
@@ -119,15 +64,12 @@ class _JobScope:
 class AxmsObservability:
     """Manual SDK bridge that never forwards application payloads or failures."""
 
-    __slots__ = ("_client", "_current_job", "_current_node")
+    __slots__ = ("_client", "_current_job")
 
     def __init__(self, client: Any | None = None) -> None:
         self._client = client
         self._current_job: ContextVar[Any | None] = ContextVar(
             "axms_langfuse_job", default=None
-        )
-        self._current_node: ContextVar[Any | None] = ContextVar(
-            "axms_langfuse_node", default=None
         )
 
     @classmethod
@@ -177,7 +119,7 @@ class AxmsObservability:
             timestamp=_utc_timestamp(),
         )
         scope = _JobScope(metadata)
-        root = self._start_root(trace_id, metadata)
+        root, root_manager = self._start_root(trace_id, metadata)
         token = self._current_job.set(root)
         started = time.perf_counter()
         try:
@@ -196,6 +138,7 @@ class AxmsObservability:
             if scope.error_code is not None:
                 final["errorCode"] = scope.error_code
             _finish(root, _metadata(**final))
+            _exit_manager(root_manager)
 
     def invoke_node(
         self,
@@ -218,8 +161,9 @@ class AxmsObservability:
             attempt=invocation.execution_attempt,
             timestamp=_utc_timestamp(),
         )
-        node_observation = _start_child(root, NODE_NAME, "span", base)
-        node_token = self._current_node.set(node_observation or root)
+        node_observation, node_manager = _start_current_child(
+            root, NODE_NAME, "span", base
+        )
         detail_name, detail_type = _detail_kind(node.node_type)
         detail = None
         detail_base = dict(base)
@@ -252,10 +196,8 @@ class AxmsObservability:
                 "errorCode": error_code,
             }
             _finish(detail, _metadata(**detail_failed))
-            _finish(node_observation, failed)
+            _close_current(node_observation, node_manager, failed)
             raise
-        finally:
-            self._current_node.reset(node_token)
 
         elapsed = _latency_ms(started)
         port = getattr(result, "port", None)
@@ -275,29 +217,8 @@ class AxmsObservability:
                 "PASSED" if port == "passed" else "FAILED"
             )
         _finish(detail, _metadata(**detail_completed))
-        _finish(node_observation, completed)
+        _close_current(node_observation, node_manager, completed)
         return result
-
-    def record_models(self, observations: tuple[ModelObservation, ...]) -> None:
-        """Emit actual Backend model facts under the active Node, if one exists."""
-
-        parent = self._current_node.get()
-        if parent is None:
-            return
-        for observation in observations:
-            if not isinstance(observation, ModelObservation):
-                continue
-            metadata = _metadata(
-                provider=observation.provider,
-                model=observation.model,
-                inputTokens=observation.input_tokens,
-                outputTokens=observation.output_tokens,
-                latencyMs=observation.latency_ms,
-            )
-            _finish(
-                _start_model(parent, observation, metadata),
-                metadata,
-            )
 
     def close(self) -> None:
         client = self._client
@@ -309,19 +230,25 @@ class AxmsObservability:
         except Exception:
             pass
 
-    def _start_root(self, trace_id: str, metadata: Mapping[str, Any]) -> Any | None:
+    def _start_root(
+        self, trace_id: str, metadata: Mapping[str, Any]
+    ) -> tuple[Any | None, Any | None]:
         if self._client is None:
-            return None
+            return None, None
+        manager = None
         try:
             langfuse_trace_id = self._client.create_trace_id(seed=trace_id)
-            return self._client.start_observation(
+            manager = self._client.start_as_current_observation(
                 name=TRACE_NAME,
                 as_type="agent",
                 trace_context={"trace_id": langfuse_trace_id},
                 metadata=dict(metadata),
+                end_on_exit=False,
             )
+            return manager.__enter__(), manager
         except Exception:
-            return None
+            _exit_manager(manager)
+            return None, None
 
 
 def _detail_kind(node_type: str) -> tuple[str | None, str]:
@@ -348,35 +275,65 @@ def _start_child(
         return None
 
 
-def _start_model(
+def _start_current_child(
     parent: Any,
-    observation: ModelObservation,
+    name: str,
+    as_type: str,
     metadata: Mapping[str, Any],
-) -> Any | None:
+) -> tuple[Any | None, Any | None]:
+    manager = None
     try:
-        return parent.start_observation(
-            name=MODEL_NAME,
-            as_type="generation",
+        manager = parent.start_as_current_observation(
+            name=name,
+            as_type=as_type,
             metadata=dict(metadata),
-            model=observation.model,
-            usage_details={
-                "input": observation.input_tokens,
-                "output": observation.output_tokens,
-            },
         )
+        return manager.__enter__(), manager
     except Exception:
-        return None
+        _exit_manager(manager)
+        return _start_child(parent, name, as_type, metadata), None
+
+
+def _close_current(
+    observation: Any | None,
+    manager: Any | None,
+    metadata: Mapping[str, Any],
+) -> None:
+    _update(observation, metadata)
+    if manager is None:
+        _end(observation)
+    else:
+        _exit_manager(manager)
 
 
 def _finish(observation: Any | None, metadata: Mapping[str, Any]) -> None:
+    _update(observation, metadata)
+    _end(observation)
+
+
+def _update(observation: Any | None, metadata: Mapping[str, Any]) -> None:
     if observation is None:
         return
     try:
         observation.update(metadata=dict(metadata))
     except Exception:
         pass
+
+
+def _end(observation: Any | None) -> None:
+    if observation is None:
+        return
     try:
         observation.end()
+    except Exception:
+        pass
+
+
+def _exit_manager(manager: Any | None) -> None:
+    if manager is None:
+        return
+    try:
+        manager.__exit__(None, None, None)
     except Exception:
         pass
 

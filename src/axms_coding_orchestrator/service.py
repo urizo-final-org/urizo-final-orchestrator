@@ -607,7 +607,6 @@ def main() -> None:
             settings.spring_origin,
             credential_resolver,
             timeout_seconds=180.0,
-            observability=observability,
         )
         coding_registry = register_coding_node_handlers(
             build_common_node_registry(),
@@ -619,7 +618,6 @@ def main() -> None:
         natural_cms_domain_client = SpringNaturalCmsDomainClient(
             settings.spring_origin,
             credential_resolver,
-            observability=observability,
         )
         natural_cms_registry = register_natural_cms_node_handlers(
             build_common_node_registry(),

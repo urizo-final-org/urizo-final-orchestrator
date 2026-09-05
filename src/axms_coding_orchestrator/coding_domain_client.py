@@ -13,6 +13,10 @@ from typing import Any, Mapping, Protocol
 from urllib.parse import urlsplit
 from uuid import UUID
 
+from opentelemetry.trace.propagation.tracecontext import (
+    TraceContextTextMapPropagator,
+)
+
 from .contracts import GIT_OBJECT_ID, SHA256_DIGEST, canonical_json_bytes
 from .model_gateway import (
     ContractViolation,
@@ -24,11 +28,6 @@ from .model_gateway import (
     _read_chunked,
 )
 from .node_runtime import NodeInvocation
-from .observability import (
-    AxmsObservability,
-    ModelObservation,
-    parse_model_observations,
-)
 from .snapshot import HANDLER_KEY, NODE_IDENTIFIER
 
 
@@ -69,6 +68,10 @@ APPROVAL_ROLES = frozenset({"GENERAL_ADMIN", "SUPER_ADMIN"})
 APPROVAL_DECISIONS = frozenset({"APPROVED", "REJECTED"})
 SAFE_ERROR_CODE = re.compile(r"^[A-Z][A-Z0-9_]{2,119}$")
 MAX_JSON_DEPTH = 64
+_TRACEPARENT = re.compile(
+    r"^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$"
+)
+_W3C_TRACE_CONTEXT = TraceContextTextMapPropagator()
 
 
 class CodingDomainClientError(RuntimeError):
@@ -150,7 +153,6 @@ class CodingStageExecutionResult:
     candidate_sha: str | None = None
     diff_digest: str | None = None
     validation_hash: str | None = None
-    model_observations: tuple[ModelObservation, ...] = ()
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> CodingStageExecutionResult:
@@ -167,7 +169,6 @@ class CodingStageExecutionResult:
             "candidateSha",
             "diffDigest",
             "validationHash",
-            "modelObservations",
         }
         _fields(payload, required, optional, "stageExecution")
         if payload["schemaVersion"] != "1.0":
@@ -201,9 +202,6 @@ class CodingStageExecutionResult:
                 SHA256_DIGEST,
                 "stageExecution.validationHash",
                 71,
-            ),
-            model_observations=parse_model_observations(
-                payload.get("modelObservations")
             ),
         )
 
@@ -502,7 +500,6 @@ class SpringCodingDomainClient:
         "_origin",
         "_credential_resolver",
         "_timeout_seconds",
-        "_observability",
     )
 
     def __init__(
@@ -512,7 +509,6 @@ class SpringCodingDomainClient:
         *,
         timeout_seconds: float = 10.0,
         allowed_origins: set[str] | frozenset[str] | None = None,
-        observability: AxmsObservability | None = None,
     ) -> None:
         origins = frozenset(
             {SPRING_PRIVATE_ORIGIN} if allowed_origins is None else allowed_origins
@@ -531,7 +527,6 @@ class SpringCodingDomainClient:
         self._origin = spring_origin
         self._credential_resolver = credential_resolver
         self._timeout_seconds = float(timeout_seconds)
-        self._observability = observability or AxmsObservability()
 
     def get_attempt(self, invocation: NodeInvocation) -> CodingAttemptAggregate:
         _invocation(invocation)
@@ -621,7 +616,6 @@ class SpringCodingDomainClient:
             or stage_result.handler_key != handler_key
         ):
             raise _invalid_response()
-        self._observability.record_models(stage_result.model_observations)
         return stage_result
 
     def _call(
@@ -763,6 +757,9 @@ def _request_coding_http(
         wire.extend(f"Host: {host_header}\r\n".encode("ascii"))
         wire.extend(b"Accept: application/json\r\n")
         wire.extend(f"X-Trace-Id: {trace_id}\r\n".encode("ascii"))
+        traceparent = _current_traceparent()
+        if traceparent is not None:
+            wire.extend(f"traceparent: {traceparent}\r\n".encode("ascii"))
         wire.extend(b"Authorization: Bearer ")
         wire.extend(credential)
         wire.extend(b"\r\n")
@@ -815,6 +812,20 @@ def _request_coding_http(
     finally:
         for index in range(len(wire)):
             wire[index] = 0
+
+
+def _current_traceparent() -> str | None:
+    carrier: dict[str, str] = {}
+    try:
+        _W3C_TRACE_CONTEXT.inject(carrier)
+    except Exception:
+        return None
+    value = carrier.get("traceparent")
+    if not isinstance(value, str) or _TRACEPARENT.fullmatch(value) is None:
+        return None
+    if value[3:35] == "0" * 32 or value[36:52] == "0" * 16:
+        return None
+    return value
 
 
 def _invalid_response(*, status: int | None = None) -> CodingDomainClientError:

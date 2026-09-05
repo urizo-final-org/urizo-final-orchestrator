@@ -120,13 +120,11 @@ observability disabled. Trace creation and background export are fail-open and
 never change a Job result. Only fixed `axms.job`, `axms.node`, `axms.model`,
 `axms.tool`, and `axms.check` names are permitted with closed operational
 metadata; prompts, completions, Source, Diff, Tool I/O, full State, secrets, and
-raw errors are never sent. `axms.model` is emitted only when the Spring stage
-response supplies the actual selected provider/model, token usage, and model
-latency. Missing or empty model observations emit nothing rather than reporting
-configured bindings as actual execution data. Actual model and token counts also
-populate Langfuse's native generation fields without sending prompt or completion
-content; Backend `latencyMs` remains closed metadata and is not used to backdate
-the observation clock.
+raw errors are never sent. Python emits only payload-free Job, Node, Tool, and
+Check observations. While an `axms.node` observation is active, Spring-bound
+stage calls retain the business UUID `X-Trace-Id` and also inject its W3C
+`traceparent`; Spring owns the actual Provider `axms.model` observation on that
+same OpenTelemetry trace.
 
 The Spring service token is read for every request and held in an erasable
 short-lived buffer. Secret contents, prompts, raw Tool results, remote error
@@ -172,7 +170,8 @@ bounded dependency failure/recovery checks.
 
 Latest verified Orchestrator evidence:
 
-- Python contract/runtime suite: 149 of 149 tests passed.
+- Python contract/runtime suite: 213 tests passed; 2 optional Valkey integration
+  tests skipped because `AXMS_TEST_VALKEY_PORT` was not configured.
 - Syntax gate: 47 Python files parsed successfully.
 - The frozen `uv.lock` image built with Python 3.12.13 and ran as non-root UID
   10001.

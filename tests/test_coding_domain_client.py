@@ -36,6 +36,7 @@ class _CodingHandler(BaseHTTPRequestHandler):
     observed_path: str | None = None
     observed_authorization: str | None = None
     observed_trace_id: str | None = None
+    observed_traceparent: str | None = None
     observed_body: dict[str, object] | None = None
 
     def do_PUT(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
@@ -43,6 +44,7 @@ class _CodingHandler(BaseHTTPRequestHandler):
         type(self).observed_path = self.path
         type(self).observed_authorization = self.headers.get("Authorization")
         type(self).observed_trace_id = self.headers.get("X-Trace-Id")
+        type(self).observed_traceparent = self.headers.get("traceparent")
         type(self).observed_body = json.loads(self.rfile.read(length))
         self._respond()
 
@@ -53,6 +55,7 @@ class _CodingHandler(BaseHTTPRequestHandler):
         type(self).observed_path = self.path
         type(self).observed_authorization = self.headers.get("Authorization")
         type(self).observed_trace_id = self.headers.get("X-Trace-Id")
+        type(self).observed_traceparent = self.headers.get("traceparent")
         type(self).observed_body = None
         self._respond()
 
@@ -74,6 +77,7 @@ def _coding_server(response: dict[str, object], *, status: int = 200):
     _CodingHandler.observed_path = None
     _CodingHandler.observed_authorization = None
     _CodingHandler.observed_trace_id = None
+    _CodingHandler.observed_traceparent = None
     _CodingHandler.observed_body = None
     server = ThreadingHTTPServer(("127.0.0.1", 0), _CodingHandler)
     worker = threading.Thread(target=server.serve_forever, daemon=True)
@@ -169,22 +173,6 @@ def _stage_execution_response() -> dict[str, object]:
         "diffDigest": DIGEST,
         "validationHash": DIGEST,
         "payload": {"status": "READY"},
-        "modelObservations": [
-            {
-                "provider": "OPENAI",
-                "modelId": "gpt-final",
-                "inputTokens": 101,
-                "outputTokens": 29,
-                "latencyMs": 450,
-            },
-            {
-                "provider": "ANTHROPIC",
-                "modelId": "claude-final",
-                "inputTokens": 203,
-                "outputTokens": 41,
-                "latencyMs": 780,
-            },
-        ],
     }
 
 
@@ -321,18 +309,11 @@ class SpringCodingDomainClientTest(unittest.TestCase):
         self.assertEqual("ready", _CodingHandler.observed_body["resultPort"])
 
     def test_execute_stage_posts_the_exact_authoritative_invocation(self) -> None:
-        observed_models: list[object] = []
-
-        class ObservationSink:
-            def record_models(self, values: object) -> None:
-                observed_models.extend(values)  # type: ignore[arg-type]
-
         with _coding_server(_stage_execution_response()) as origin:
             client = SpringCodingDomainClient(
                 origin,
                 self._credential,
                 allowed_origins={origin},
-                observability=ObservationSink(),  # type: ignore[arg-type]
             )
             result = client.execute_stage(
                 _invocation(), "coding.preview", RESULT_ID
@@ -340,12 +321,6 @@ class SpringCodingDomainClientTest(unittest.TestCase):
 
         self.assertIsInstance(result, CodingStageExecutionResult)
         self.assertEqual("ready", result.result_port)
-        self.assertEqual(2, len(result.model_observations))
-        self.assertEqual("gpt-final", result.model_observations[0].model)
-        self.assertEqual(101, result.model_observations[0].input_tokens)
-        self.assertEqual("claude-final", result.model_observations[1].model)
-        self.assertEqual(780, result.model_observations[1].latency_ms)
-        self.assertEqual(list(result.model_observations), observed_models)
         self.assertEqual(
             f"/internal/coding/worker/jobs/{JOB_ID}/attempts/2/stages/"
             f"coding.preview/executions/{RESULT_ID}",
@@ -367,6 +342,65 @@ class SpringCodingDomainClientTest(unittest.TestCase):
             "Bearer spring-service-test-token", _CodingHandler.observed_authorization
         )
         self.assertEqual(TRACE_ID, _CodingHandler.observed_trace_id)
+
+    def test_active_otel_context_injects_w3c_traceparent_without_changing_trace_id(self) -> None:
+        from opentelemetry.sdk.trace import TracerProvider
+
+        provider = TracerProvider()
+        tracer = provider.get_tracer(__name__)
+        with _coding_server(_stage_execution_response()) as origin:
+            client = SpringCodingDomainClient(
+                origin, self._credential, allowed_origins={origin}
+            )
+            with tracer.start_as_current_span("axms.node") as span:
+                client.execute_stage(_invocation(), "coding.preview", RESULT_ID)
+                context = span.get_span_context()
+
+        self.assertEqual(TRACE_ID, _CodingHandler.observed_trace_id)
+        traceparent = _CodingHandler.observed_traceparent
+        self.assertIsNotNone(traceparent)
+        parts = str(traceparent).split("-")
+        self.assertEqual(f"{context.trace_id:032x}", parts[1])
+        self.assertEqual(f"{context.span_id:016x}", parts[2])
+
+    def test_missing_or_failed_otel_injection_is_fail_open(self) -> None:
+        with _coding_server(_stage_execution_response()) as origin:
+            client = SpringCodingDomainClient(
+                origin, self._credential, allowed_origins={origin}
+            )
+            result = client.execute_stage(
+                _invocation(), "coding.preview", RESULT_ID
+            )
+        self.assertEqual("ready", result.result_port)
+        self.assertIsNone(_CodingHandler.observed_traceparent)
+
+        with _coding_server(_stage_execution_response()) as origin:
+            client = SpringCodingDomainClient(
+                origin, self._credential, allowed_origins={origin}
+            )
+            with patch(
+                "axms_coding_orchestrator.coding_domain_client."
+                "_W3C_TRACE_CONTEXT.inject",
+                side_effect=RuntimeError("FORBIDDEN_INJECTOR_DETAIL"),
+            ):
+                result = client.execute_stage(
+                    _invocation(), "coding.preview", RESULT_ID
+                )
+        self.assertEqual("ready", result.result_port)
+        self.assertIsNone(_CodingHandler.observed_traceparent)
+
+    def test_stage_response_model_observations_are_no_longer_part_of_contract(self) -> None:
+        response = _stage_execution_response()
+        response["modelObservations"] = []
+        with patch(
+            "axms_coding_orchestrator.coding_domain_client._request_coding_http",
+            return_value=(200, json.dumps(response).encode("utf-8")),
+        ):
+            with self.assertRaises(CodingDomainClientError) as raised:
+                self._client().execute_stage(
+                    _invocation(), "coding.preview", RESULT_ID
+                )
+        self.assertEqual("WORKER_RESPONSE_INVALID", raised.exception.code)
 
     def test_real_get_maps_correlated_error_envelope_and_sends_trace_header(self) -> None:
         response = {
