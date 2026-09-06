@@ -17,6 +17,7 @@ from .graph_builder import (
 )
 from .natural_cms_domain_client import NaturalCmsDomainClient, NaturalCmsJob
 from .node_runtime import NodeRegistry
+from .observability import AxmsObservability
 from .snapshot import VersionedSnapshot
 
 
@@ -27,7 +28,13 @@ class _ProfileVersionReader(Protocol):
 class NaturalCmsSnapshotRunner:
     """Run only Spring-owned Natural CMS Jobs on the shared Snapshot checkpointer."""
 
-    __slots__ = ("_jobs", "_profiles", "_registry", "_checkpointer")
+    __slots__ = (
+        "_jobs",
+        "_profiles",
+        "_registry",
+        "_checkpointer",
+        "_observability",
+    )
 
     def __init__(
         self,
@@ -35,6 +42,7 @@ class NaturalCmsSnapshotRunner:
         profiles: _ProfileVersionReader,
         registry: NodeRegistry,
         checkpointer: Any,
+        observability: AxmsObservability | None = None,
     ) -> None:
         if not callable(getattr(jobs, "resolve_job", None)):
             raise TypeError("jobs must implement resolve_job(job)")
@@ -48,11 +56,29 @@ class NaturalCmsSnapshotRunner:
         self._profiles = profiles
         self._registry = registry
         self._checkpointer = checkpointer
+        self._observability = observability or AxmsObservability()
 
     def invoke(self, reference: QueuedJobReference) -> Mapping[str, Any]:
         if not isinstance(reference, QueuedJobReference):
             raise TypeError("reference must be a QueuedJobReference")
         job = self._jobs.resolve_job(reference)
+        with self._observability.job(
+            job_id=job.job_id,
+            trace_id=job.trace_id,
+            profile_version_id=job.profile_version_id,
+            attempt=job.pipeline_attempt,
+        ) as observation:
+            result = self._invoke_resolved(reference, job)
+            status = result.get("status")
+            if isinstance(status, str):
+                observation.finish(status)
+            return result
+
+    def _invoke_resolved(
+        self,
+        reference: QueuedJobReference,
+        job: NaturalCmsJob,
+    ) -> Mapping[str, Any]:
         if job.status in {"COMPLETED", "REJECTED"}:
             return {"jobId": job.job_id, "status": "COMPLETED"}
 
@@ -63,7 +89,9 @@ class NaturalCmsSnapshotRunner:
             )
         digest = "sha256:" + hashlib.sha256(snapshot.to_json()).hexdigest()
         try:
-            graph = SnapshotGraphBuilder(self._registry).compile(
+            graph = SnapshotGraphBuilder(
+                self._registry, self._observability
+            ).compile(
                 snapshot,
                 checkpointer=self._checkpointer,
             )

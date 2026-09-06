@@ -13,6 +13,10 @@ from typing import Any, Mapping, Protocol
 from urllib.parse import urlsplit
 from uuid import UUID
 
+from opentelemetry.trace.propagation.tracecontext import (
+    TraceContextTextMapPropagator,
+)
+
 from .contracts import GIT_OBJECT_ID, SHA256_DIGEST, canonical_json_bytes
 from .model_gateway import (
     ContractViolation,
@@ -64,6 +68,10 @@ APPROVAL_ROLES = frozenset({"GENERAL_ADMIN", "SUPER_ADMIN"})
 APPROVAL_DECISIONS = frozenset({"APPROVED", "REJECTED"})
 SAFE_ERROR_CODE = re.compile(r"^[A-Z][A-Z0-9_]{2,119}$")
 MAX_JSON_DEPTH = 64
+_TRACEPARENT = re.compile(
+    r"^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$"
+)
+_W3C_TRACE_CONTEXT = TraceContextTextMapPropagator()
 
 
 class CodingDomainClientError(RuntimeError):
@@ -156,7 +164,12 @@ class CodingStageExecutionResult:
             "resultPort",
             "payload",
         }
-        optional = {"workspaceId", "candidateSha", "diffDigest", "validationHash"}
+        optional = {
+            "workspaceId",
+            "candidateSha",
+            "diffDigest",
+            "validationHash",
+        }
         _fields(payload, required, optional, "stageExecution")
         if payload["schemaVersion"] != "1.0":
             raise ValueError("stageExecution.schemaVersion is invalid")
@@ -483,7 +496,11 @@ class CodingDomainClient(Protocol):
 class SpringCodingDomainClient:
     """Read and atomically record only the current Spring Coding attempt."""
 
-    __slots__ = ("_origin", "_credential_resolver", "_timeout_seconds")
+    __slots__ = (
+        "_origin",
+        "_credential_resolver",
+        "_timeout_seconds",
+    )
 
     def __init__(
         self,
@@ -740,6 +757,9 @@ def _request_coding_http(
         wire.extend(f"Host: {host_header}\r\n".encode("ascii"))
         wire.extend(b"Accept: application/json\r\n")
         wire.extend(f"X-Trace-Id: {trace_id}\r\n".encode("ascii"))
+        traceparent = _current_traceparent()
+        if traceparent is not None:
+            wire.extend(f"traceparent: {traceparent}\r\n".encode("ascii"))
         wire.extend(b"Authorization: Bearer ")
         wire.extend(credential)
         wire.extend(b"\r\n")
@@ -792,6 +812,20 @@ def _request_coding_http(
     finally:
         for index in range(len(wire)):
             wire[index] = 0
+
+
+def _current_traceparent() -> str | None:
+    carrier: dict[str, str] = {}
+    try:
+        _W3C_TRACE_CONTEXT.inject(carrier)
+    except Exception:
+        return None
+    value = carrier.get("traceparent")
+    if not isinstance(value, str) or _TRACEPARENT.fullmatch(value) is None:
+        return None
+    if value[3:35] == "0" * 32 or value[36:52] == "0" * 16:
+        return None
+    return value
 
 
 def _invalid_response(*, status: int | None = None) -> CodingDomainClientError:

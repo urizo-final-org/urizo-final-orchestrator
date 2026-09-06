@@ -106,6 +106,28 @@ AXMS_HEALTH_PORT=8090
 LANGGRAPH_STRICT_MSGPACK=true
 ```
 
+Optional Langfuse Cloud observability is enabled only when all three values are
+present and the Japan endpoint matches exactly:
+
+```text
+LANGFUSE_PUBLIC_KEY=<environment-provided>
+LANGFUSE_SECRET_KEY=<environment-provided>
+LANGFUSE_BASE_URL=https://jp.cloud.langfuse.com
+```
+
+Missing, partial, invalid, or unavailable Langfuse configuration leaves
+observability disabled. Trace creation and background export are fail-open and
+never change a Job result. Only fixed `axms.job`, `axms.node`, `axms.model`,
+`axms.tool`, and `axms.check` names are permitted with closed operational
+metadata; prompts, completions, Source, Diff, Tool I/O, full State, secrets, and
+raw errors are never sent. Python emits only payload-free Job, Node, Tool, and
+Check observations. While an `axms.node` observation is active, Spring-bound
+stage calls retain the business UUID `X-Trace-Id` and also inject its W3C
+`traceparent`; Spring owns the actual Provider `axms.model` observation on that
+same OpenTelemetry trace. Langfuse uses a runtime-owned OpenTelemetry provider
+with the fixed `service.name=axms-coding-orchestrator` Resource; ambient OTel
+Resource environment variables and an existing global provider are not reused.
+
 The Spring service token is read for every request and held in an erasable
 short-lived buffer. Secret contents, prompts, raw Tool results, remote error
 bodies, and credential digests are never logged.
@@ -150,7 +172,8 @@ bounded dependency failure/recovery checks.
 
 Latest verified Orchestrator evidence:
 
-- Python contract/runtime suite: 149 of 149 tests passed.
+- Python contract/runtime suite: 217 total, 215 passed, and 2 optional Valkey
+  integration tests skipped because `AXMS_TEST_VALKEY_PORT` was not configured.
 - Syntax gate: 47 Python files parsed successfully.
 - The frozen `uv.lock` image built with Python 3.12.13 and ran as non-root UID
   10001.

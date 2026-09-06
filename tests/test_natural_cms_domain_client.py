@@ -165,6 +165,20 @@ class SpringNaturalCmsDomainClientTest(unittest.TestCase):
         self.assertEqual(b"spring-service-test-token", observed["credential"])
         self.assertEqual(TRACE_ID, observed["trace_id"])
 
+    def test_stage_response_model_observations_are_no_longer_part_of_contract(self) -> None:
+        base = {
+            "schemaVersion": "1.0",
+            "resultId": RESULT_ID,
+            "handlerKey": "cms.preview",
+            "resultPort": "ready",
+            "resource": {"type": "CONTENT", "id": "7"},
+            "payload": {"status": "READY"},
+        }
+        self.assertEqual("ready", NaturalCmsStageResult.from_dict(base).result_port)
+        base["modelObservations"] = []
+        with self.assertRaisesRegex(ValueError, "stage fields are invalid"):
+            NaturalCmsStageResult.from_dict(base)
+
 
 if __name__ == "__main__":
     unittest.main()

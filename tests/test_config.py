@@ -4,7 +4,11 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from axms_coding_orchestrator.config import ConfigurationError, RuntimeSettings
+from axms_coding_orchestrator.config import (
+    ConfigurationError,
+    LangfuseSettings,
+    RuntimeSettings,
+)
 
 
 class RuntimeSettingsTest(unittest.TestCase):
@@ -73,6 +77,31 @@ class RuntimeSettingsTest(unittest.TestCase):
         settings = RuntimeSettings.from_environment(self.environment())
         with self.assertRaisesRegex(ConfigurationError, "exactly 32"):
             settings.checkpoint_encryption_key()
+
+    def test_langfuse_settings_require_all_environment_values_and_japan_host(self) -> None:
+        self.assertIsNone(LangfuseSettings.from_environment({}))
+        self.assertIsNone(
+            LangfuseSettings.from_environment(
+                {
+                    "LANGFUSE_PUBLIC_KEY": "public-test",
+                    "LANGFUSE_SECRET_KEY": "secret-test",
+                    "LANGFUSE_BASE_URL": "https://cloud.langfuse.com",
+                }
+            )
+        )
+
+        settings = LangfuseSettings.from_environment(
+            {
+                "LANGFUSE_PUBLIC_KEY": "public-test",
+                "LANGFUSE_SECRET_KEY": "secret-test",
+                "LANGFUSE_BASE_URL": "https://jp.cloud.langfuse.com",
+            }
+        )
+
+        self.assertIsNotNone(settings)
+        assert settings is not None
+        self.assertNotIn("public-test", repr(settings))
+        self.assertNotIn("secret-test", repr(settings))
 
 
 if __name__ == "__main__":

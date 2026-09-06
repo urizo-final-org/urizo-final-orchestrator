@@ -29,6 +29,30 @@ Handler = Callable[[NodeInvocation], NodeResult]
 ConfigValidator = Callable[[Mapping[str, Any]], str | None]
 
 
+class _ObservationProbe:
+    def __init__(self) -> None:
+        self.records: list[dict[str, str]] = []
+
+    def invoke_node(
+        self,
+        *,
+        node: object,
+        invocation: NodeInvocation,
+        handler: Callable[[NodeInvocation], Any],
+    ) -> Any:
+        try:
+            result = handler(invocation)
+        except BaseException:
+            self.records.append(
+                {"nodeId": invocation.node_id, "nodeStatus": "FAILED"}
+            )
+            raise
+        self.records.append(
+            {"nodeId": invocation.node_id, "nodeStatus": "COMPLETED"}
+        )
+        return result
+
+
 def _node(
     node_id: str,
     node_type: str,
@@ -356,13 +380,16 @@ class SnapshotGraphBuilderTest(unittest.TestCase):
     def test_bounded_fixture_repeat_rejects_the_next_transition(self) -> None:
         snapshot = _loop_snapshot(max_iterations=2)
         log: list[tuple[str, NodeInvocation]] = []
+        observations = _ObservationProbe()
 
         def work(invocation: NodeInvocation) -> NodeResult:
             log.append(("fixture.work", invocation))
             return NodeResult.create("fixture_repeat")
 
         handlers = _linear_handlers(log, work=work)
-        graph = SnapshotGraphBuilder(_registry(snapshot, handlers)).compile(snapshot)
+        graph = SnapshotGraphBuilder(
+            _registry(snapshot, handlers), observations  # type: ignore[arg-type]
+        ).compile(snapshot)
 
         with self.assertRaisesRegex(SnapshotGraphExecutionError, "bounded loop"):
             graph.invoke(_state())
@@ -370,6 +397,11 @@ class SnapshotGraphBuilderTest(unittest.TestCase):
         names = [name for name, _ in log]
         self.assertEqual(3, names.count("fixture.work"))
         self.assertNotIn("fixture.end", names)
+        self.assertEqual(
+            {"nodeId": "fixture_work", "nodeStatus": "FAILED"},
+            observations.records[-1],
+        )
+        self.assertNotIn("bounded loop", repr(observations.records))
 
     def test_build_rejects_an_unregistered_fixture_handler(self) -> None:
         snapshot = _linear_snapshot()
@@ -435,13 +467,16 @@ class SnapshotGraphBuilderTest(unittest.TestCase):
     def test_execution_rejects_an_undeclared_fixture_runtime_port(self) -> None:
         snapshot = _linear_snapshot()
         log: list[tuple[str, NodeInvocation]] = []
+        observations = _ObservationProbe()
 
         def work(invocation: NodeInvocation) -> NodeResult:
             log.append(("fixture.work", invocation))
             return NodeResult.create("fixture_unexpected")
 
         handlers = _linear_handlers(log, work=work)
-        graph = SnapshotGraphBuilder(_registry(snapshot, handlers)).compile(snapshot)
+        graph = SnapshotGraphBuilder(
+            _registry(snapshot, handlers), observations  # type: ignore[arg-type]
+        ).compile(snapshot)
 
         with self.assertRaisesRegex(SnapshotGraphExecutionError, "undeclared port"):
             graph.invoke(_state())
@@ -450,6 +485,34 @@ class SnapshotGraphBuilderTest(unittest.TestCase):
             ["fixture.start", "fixture.guardrail", "fixture.work"],
             [name for name, _ in log],
         )
+        self.assertEqual(
+            {"nodeId": "fixture_work", "nodeStatus": "FAILED"},
+            observations.records[-1],
+        )
+        self.assertNotIn("undeclared port", repr(observations.records))
+
+    def test_invalid_node_result_fails_inside_the_node_observation(self) -> None:
+        snapshot = _linear_snapshot()
+        log: list[tuple[str, NodeInvocation]] = []
+        observations = _ObservationProbe()
+
+        def work(invocation: NodeInvocation) -> object:
+            log.append(("fixture.work", invocation))
+            return object()
+
+        handlers = _linear_handlers(log, work=work)  # type: ignore[arg-type]
+        graph = SnapshotGraphBuilder(
+            _registry(snapshot, handlers), observations  # type: ignore[arg-type]
+        ).compile(snapshot)
+
+        with self.assertRaisesRegex(SnapshotGraphExecutionError, "invalid NodeResult"):
+            graph.invoke(_state())
+
+        self.assertEqual(
+            {"nodeId": "fixture_work", "nodeStatus": "FAILED"},
+            observations.records[-1],
+        )
+        self.assertNotIn("invalid NodeResult", repr(observations.records))
 
     def test_execution_rejects_a_mismatched_profile_version_before_handlers(self) -> None:
         snapshot = _linear_snapshot()

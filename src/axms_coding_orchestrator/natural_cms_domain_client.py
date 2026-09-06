@@ -149,9 +149,7 @@ class NaturalCmsStageResult:
         required = {
             "schemaVersion", "resultId", "handlerKey", "resultPort", "resource", "payload"
         }
-        allowed = required | {
-            "structuredCommand", "previewId", "previewHash"
-        }
+        allowed = required | {"structuredCommand", "previewId", "previewHash"}
         if (
             not required.issubset(data)
             or not set(data).issubset(allowed)
@@ -197,7 +195,11 @@ class NaturalCmsDomainClient(Protocol):
 
 
 class SpringNaturalCmsDomainClient:
-    __slots__ = ("_origin", "_credential_resolver", "_timeout_seconds")
+    __slots__ = (
+        "_origin",
+        "_credential_resolver",
+        "_timeout_seconds",
+    )
 
     def __init__(
         self,

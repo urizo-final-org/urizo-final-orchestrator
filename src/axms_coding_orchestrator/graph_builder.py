@@ -14,6 +14,7 @@ from .node_runtime import (
     NodeRegistryViolation,
     NodeResult,
 )
+from .observability import AxmsObservability
 from .snapshot import SnapshotNode, VersionedSnapshot
 
 
@@ -50,12 +51,17 @@ class _SnapshotGraphState(TypedDict, total=False):
 class SnapshotGraphBuilder:
     """Build one in-memory LangGraph without changing the current Coding runner."""
 
-    __slots__ = ("_registry",)
+    __slots__ = ("_registry", "_observability")
 
-    def __init__(self, registry: NodeRegistry) -> None:
+    def __init__(
+        self,
+        registry: NodeRegistry,
+        observability: AxmsObservability | None = None,
+    ) -> None:
         if not isinstance(registry, NodeRegistry):
             raise TypeError("registry must be a NodeRegistry")
         self._registry = registry
+        self._observability = observability or AxmsObservability()
 
     def compile(self, snapshot: VersionedSnapshot, checkpointer: Any = None) -> Any:
         if not isinstance(snapshot, VersionedSnapshot):
@@ -110,6 +116,7 @@ class SnapshotGraphBuilder:
                     handlers[node.node_id],
                     routes,
                     limits,
+                    self._observability,
                 ),
             )
 
@@ -141,44 +148,57 @@ def _node_action(
     handler: NodeHandler,
     routes: Mapping[tuple[str, str], str],
     limits: Mapping[str, int],
+    observability: AxmsObservability,
 ) -> Callable[[_SnapshotGraphState], dict[str, Any]]:
     def run(state: _SnapshotGraphState) -> dict[str, Any]:
         invocation = _invocation(snapshot, node, state)
-        result = handler(invocation)
-        if not isinstance(result, NodeResult):
-            raise SnapshotGraphExecutionError(
-                f"node '{node.node_id}' returned an invalid NodeResult"
-            )
+        validated: dict[str, Any] = {}
 
-        if node.node_type == "end":
-            if result.port is not None:
+        def handle_and_validate(current: NodeInvocation) -> NodeResult:
+            result = handler(current)
+            if not isinstance(result, NodeResult):
                 raise SnapshotGraphExecutionError(
-                    f"end node '{node.node_id}' returned a result port"
+                    f"node '{node.node_id}' returned an invalid NodeResult"
                 )
-        elif result.port not in node.result_ports:
-            port = "TERMINAL" if result.port is None else result.port
-            raise SnapshotGraphExecutionError(
-                f"node '{node.node_id}' returned undeclared port '{port}'"
-            )
 
-        counts = _loop_counts(state.get("_snapshotLoopCounts"), limits)
-        if result.port is not None:
-            target = routes[(node.node_id, result.port)]
-            route_key = _route_key(node.node_id, result.port, target)
-            maximum = limits.get(route_key)
-            if maximum is not None:
-                count = counts.get(route_key, 0) + 1
-                if count > maximum:
+            if node.node_type == "end":
+                if result.port is not None:
                     raise SnapshotGraphExecutionError(
-                        f"node '{node.node_id}' exceeded its bounded loop"
+                        f"end node '{node.node_id}' returned a result port"
                     )
-                counts[route_key] = count
+            elif result.port not in node.result_ports:
+                port = "TERMINAL" if result.port is None else result.port
+                raise SnapshotGraphExecutionError(
+                    f"node '{node.node_id}' returned undeclared port '{port}'"
+                )
 
-        context = invocation.context
-        context.update(result.updates)
+            counts = _loop_counts(state.get("_snapshotLoopCounts"), limits)
+            if result.port is not None:
+                target = routes[(node.node_id, result.port)]
+                route_key = _route_key(node.node_id, result.port, target)
+                maximum = limits.get(route_key)
+                if maximum is not None:
+                    count = counts.get(route_key, 0) + 1
+                    if count > maximum:
+                        raise SnapshotGraphExecutionError(
+                            f"node '{node.node_id}' exceeded its bounded loop"
+                        )
+                    counts[route_key] = count
+
+            context = current.context
+            context.update(result.updates)
+            validated["context"] = context
+            validated["counts"] = counts
+            return result
+
+        result = observability.invoke_node(
+            node=node,
+            invocation=invocation,
+            handler=handle_and_validate,
+        )
         return {
-            "context": context,
-            "_snapshotLoopCounts": counts,
+            "context": validated["context"],
+            "_snapshotLoopCounts": validated["counts"],
             "_snapshotLastNodeId": node.node_id,
             "_snapshotLastResultPort": result.port,
         }
