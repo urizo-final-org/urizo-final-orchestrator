@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from asyncio import CancelledError
 import json
 import os
 import subprocess
@@ -7,6 +8,8 @@ import sys
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+
+from langgraph.errors import GraphInterrupt
 
 from axms_coding_orchestrator.coding_domain_client import _current_traceparent
 from axms_coding_orchestrator.observability import (
@@ -391,6 +394,78 @@ print(json.dumps(payload, sort_keys=True))
         )
         self.assertNotIn("FORBIDDEN_RAW_ERROR", serialized)
         self.assertIn("MODEL_TIMEOUT", serialized)
+        node_observation = next(
+            observation
+            for observation in client.observations
+            if observation.name == "axms.node"
+        )
+        self.assertEqual("FAILED", node_observation.metadata["nodeStatus"])
+
+    def test_graph_interrupt_is_rethrown_without_marking_node_failed(self) -> None:
+        client = _FakeClient()
+        observability = AxmsObservability(client)
+        interruption = GraphInterrupt()
+
+        with observability.job(
+            job_id=JOB_ID,
+            trace_id=TRACE_ID,
+            profile_version_id=PROFILE_VERSION_ID,
+            attempt=1,
+        ):
+            try:
+                observability.invoke_node(
+                    node=SimpleNamespace(node_type="approval"),
+                    invocation=_invocation("approval"),
+                    handler=lambda _invocation: (_ for _ in ()).throw(
+                        interruption
+                    ),
+                )
+            except GraphInterrupt as caught:
+                self.assertIs(interruption, caught)
+            else:
+                self.fail("GraphInterrupt was not rethrown")
+
+        node_observation = next(
+            observation
+            for observation in client.observations
+            if observation.name == "axms.node"
+        )
+        self.assertEqual("RUNNING", node_observation.metadata["nodeStatus"])
+        self.assertNotIn("errorCode", node_observation.metadata)
+        self.assertNotIn("GraphInterrupt", repr(node_observation.metadata))
+
+    def test_cancellation_is_rethrown_without_marking_node_failed(self) -> None:
+        client = _FakeClient()
+        observability = AxmsObservability(client)
+        cancellation = CancelledError("FORBIDDEN_CANCEL_DETAIL")
+
+        with observability.job(
+            job_id=JOB_ID,
+            trace_id=TRACE_ID,
+            profile_version_id=PROFILE_VERSION_ID,
+            attempt=1,
+        ):
+            try:
+                observability.invoke_node(
+                    node=SimpleNamespace(node_type="agent"),
+                    invocation=_invocation(),
+                    handler=lambda _invocation: (_ for _ in ()).throw(
+                        cancellation
+                    ),
+                )
+            except CancelledError as caught:
+                self.assertIs(cancellation, caught)
+            else:
+                self.fail("CancelledError was not rethrown")
+
+        node_observation = next(
+            observation
+            for observation in client.observations
+            if observation.name == "axms.node"
+        )
+        self.assertEqual("RUNNING", node_observation.metadata["nodeStatus"])
+        self.assertNotIn("errorCode", node_observation.metadata)
+        self.assertNotIn("FORBIDDEN_CANCEL_DETAIL", repr(node_observation.metadata))
 
     def test_sdk_start_update_end_and_shutdown_failures_are_fail_open(self) -> None:
         for client in (

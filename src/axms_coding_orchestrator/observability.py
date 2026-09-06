@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from asyncio import CancelledError as AsyncCancelledError
+from concurrent.futures import CancelledError as FutureCancelledError
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
 import re
 import time
 from typing import Any, Callable, Iterator, Mapping
+
+from langgraph.errors import GraphInterrupt
 
 from .config import LangfuseSettings
 
@@ -190,6 +194,10 @@ class AxmsObservability:
         try:
             result = handler(invocation)
         except BaseException as failure:
+            if _is_non_failure_interruption(failure):
+                _finish(detail, _metadata(**detail_base))
+                _close_current(node_observation, node_manager, base)
+                raise
             error_code = _safe_error_code(failure)
             elapsed = _latency_ms(started)
             failed_values = {
@@ -382,6 +390,13 @@ def _safe_error_code(failure: BaseException) -> str:
     if isinstance(code, str) and _ERROR_CODE.fullmatch(code):
         return code
     return "INTERNAL_TRANSIENT_ERROR"
+
+
+def _is_non_failure_interruption(failure: BaseException) -> bool:
+    return isinstance(
+        failure,
+        (GraphInterrupt, AsyncCancelledError, FutureCancelledError),
+    )
 
 
 def _utc_timestamp() -> str:
