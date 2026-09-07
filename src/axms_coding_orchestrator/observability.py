@@ -33,6 +33,9 @@ ALLOWED_METADATA_KEYS = frozenset(
         "nodeType",
         "nodeStatus",
         "attempt",
+        "pipelineAttempt",
+        "executionAttempt",
+        "nodeSequence",
         "provider",
         "model",
         "inputTokens",
@@ -69,7 +72,12 @@ class _JobScope:
 class AxmsObservability:
     """Manual SDK bridge that never forwards application payloads or failures."""
 
-    __slots__ = ("_client", "_tracer_provider", "_current_job")
+    __slots__ = (
+        "_client",
+        "_tracer_provider",
+        "_current_job",
+        "_current_trace_id",
+    )
 
     def __init__(
         self,
@@ -80,6 +88,9 @@ class AxmsObservability:
         self._tracer_provider = tracer_provider
         self._current_job: ContextVar[Any | None] = ContextVar(
             "axms_langfuse_job", default=None
+        )
+        self._current_trace_id: ContextVar[str | None] = ContextVar(
+            "axms_langfuse_trace_id", default=None
         )
 
     @classmethod
@@ -115,6 +126,11 @@ class AxmsObservability:
     def enabled(self) -> bool:
         return self._client is not None
 
+    def current_trace_id(self) -> str | None:
+        """Return only the native trace identifier for exact, optional read correlation."""
+
+        return self._current_trace_id.get()
+
     @contextmanager
     def job(
         self,
@@ -133,8 +149,9 @@ class AxmsObservability:
             timestamp=_utc_timestamp(),
         )
         scope = _JobScope(metadata)
-        root, root_manager = self._start_root(trace_id, metadata)
+        root, root_manager, native_trace_id = self._start_root(trace_id, metadata)
         token = self._current_job.set(root)
+        trace_token = self._current_trace_id.set(native_trace_id)
         started = time.perf_counter()
         try:
             yield scope
@@ -144,6 +161,7 @@ class AxmsObservability:
             raise
         finally:
             self._current_job.reset(token)
+            self._current_trace_id.reset(trace_token)
             final = {
                 **metadata,
                 "status": scope.status,
@@ -160,11 +178,21 @@ class AxmsObservability:
         node: Any,
         invocation: Any,
         handler: Callable[[Any], Any],
+        node_sequence: int | None = None,
     ) -> Any:
         root = self._current_job.get()
         if root is None:
             return handler(invocation)
 
+        sequence_metadata = (
+            {}
+            if node_sequence is None
+            else {
+                "pipelineAttempt": str(invocation.pipeline_attempt),
+                "executionAttempt": str(invocation.execution_attempt),
+                "nodeSequence": str(node_sequence),
+            }
+        )
         base = _metadata(
             jobId=invocation.job_id,
             traceId=invocation.trace_id,
@@ -174,6 +202,7 @@ class AxmsObservability:
             nodeStatus="RUNNING",
             attempt=invocation.execution_attempt,
             timestamp=_utc_timestamp(),
+            **sequence_metadata,
         )
         node_observation, node_manager = _start_current_child(
             root, NODE_NAME, "span", base
@@ -252,9 +281,9 @@ class AxmsObservability:
 
     def _start_root(
         self, trace_id: str, metadata: Mapping[str, Any]
-    ) -> tuple[Any | None, Any | None]:
+    ) -> tuple[Any | None, Any | None, str | None]:
         if self._client is None:
-            return None, None
+            return None, None, None
         manager = None
         try:
             langfuse_trace_id = self._client.create_trace_id(seed=trace_id)
@@ -265,10 +294,10 @@ class AxmsObservability:
                 metadata=dict(metadata),
                 end_on_exit=False,
             )
-            return manager.__enter__(), manager
+            return manager.__enter__(), manager, langfuse_trace_id
         except Exception:
             _exit_manager(manager)
-            return None, None
+            return None, None, None
 
 
 def _detail_kind(node_type: str) -> tuple[str | None, str]:

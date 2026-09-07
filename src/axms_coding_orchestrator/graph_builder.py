@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+from asyncio import CancelledError as AsyncCancelledError
+from concurrent.futures import CancelledError as FutureCancelledError
 from typing import Any, Callable, Mapping, TypedDict
 
 from langgraph.graph import END, START, StateGraph
+from langgraph.errors import GraphInterrupt
 
+from .monitoring_client import NodeMonitoringReporter
 from .node_runtime import (
     NodeContractViolation,
     NodeHandler,
@@ -46,22 +50,25 @@ class _SnapshotGraphState(TypedDict, total=False):
     _snapshotClaim: dict[str, Any]
     _snapshotLedger: dict[str, Any]
     _snapshotProfileDigest: str
+    _monitorNodeSequence: int
 
 
 class SnapshotGraphBuilder:
     """Build one in-memory LangGraph without changing the current Coding runner."""
 
-    __slots__ = ("_registry", "_observability")
+    __slots__ = ("_registry", "_observability", "_monitoring")
 
     def __init__(
         self,
         registry: NodeRegistry,
         observability: AxmsObservability | None = None,
+        monitoring: NodeMonitoringReporter | None = None,
     ) -> None:
         if not isinstance(registry, NodeRegistry):
             raise TypeError("registry must be a NodeRegistry")
         self._registry = registry
         self._observability = observability or AxmsObservability()
+        self._monitoring = monitoring
 
     def compile(self, snapshot: VersionedSnapshot, checkpointer: Any = None) -> Any:
         if not isinstance(snapshot, VersionedSnapshot):
@@ -117,6 +124,7 @@ class SnapshotGraphBuilder:
                     routes,
                     limits,
                     self._observability,
+                    self._monitoring,
                 ),
             )
 
@@ -149,10 +157,23 @@ def _node_action(
     routes: Mapping[tuple[str, str], str],
     limits: Mapping[str, int],
     observability: AxmsObservability,
+    monitoring: NodeMonitoringReporter | None,
 ) -> Callable[[_SnapshotGraphState], dict[str, Any]]:
     def run(state: _SnapshotGraphState) -> dict[str, Any]:
         invocation = _invocation(snapshot, node, state)
+        node_sequence = _next_node_sequence(state.get("_monitorNodeSequence"))
+        trace_resolver = getattr(observability, "current_trace_id", None)
+        observation_trace_id = trace_resolver() if callable(trace_resolver) else None
         validated: dict[str, Any] = {}
+
+        _report_node(
+            monitoring,
+            node=node,
+            invocation=invocation,
+            node_sequence=node_sequence,
+            status="RUNNING",
+            observation_trace_id=observation_trace_id,
+        )
 
         def handle_and_validate(current: NodeInvocation) -> NodeResult:
             result = handler(current)
@@ -191,19 +212,93 @@ def _node_action(
             validated["counts"] = counts
             return result
 
-        result = observability.invoke_node(
+        try:
+            if callable(trace_resolver):
+                result = observability.invoke_node(
+                    node=node,
+                    invocation=invocation,
+                    handler=handle_and_validate,
+                    node_sequence=node_sequence,
+                )
+            else:
+                result = observability.invoke_node(
+                    node=node,
+                    invocation=invocation,
+                    handler=handle_and_validate,
+                )
+        except GraphInterrupt:
+            _report_node(
+                monitoring,
+                node=node,
+                invocation=invocation,
+                node_sequence=node_sequence,
+                status="WAITING_APPROVAL",
+                observation_trace_id=observation_trace_id,
+            )
+            raise
+        except (AsyncCancelledError, FutureCancelledError):
+            raise
+        except Exception:
+            _report_node(
+                monitoring,
+                node=node,
+                invocation=invocation,
+                node_sequence=node_sequence,
+                status="FAILED",
+                observation_trace_id=observation_trace_id,
+                error_code="NODE_EXECUTION_FAILED",
+            )
+            raise
+        _report_node(
+            monitoring,
             node=node,
             invocation=invocation,
-            handler=handle_and_validate,
+            node_sequence=node_sequence,
+            status="COMPLETED",
+            observation_trace_id=observation_trace_id,
         )
         return {
             "context": validated["context"],
             "_snapshotLoopCounts": validated["counts"],
             "_snapshotLastNodeId": node.node_id,
             "_snapshotLastResultPort": result.port,
+            "_monitorNodeSequence": node_sequence,
         }
 
     return run
+
+
+def _next_node_sequence(value: Any) -> int:
+    if value is None:
+        return 1
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise SnapshotGraphExecutionError("snapshot monitoring sequence is invalid")
+    return value + 1
+
+
+def _report_node(
+    monitoring: NodeMonitoringReporter | None,
+    *,
+    node: SnapshotNode,
+    invocation: NodeInvocation,
+    node_sequence: int,
+    status: str,
+    observation_trace_id: str | None,
+    error_code: str | None = None,
+) -> None:
+    if monitoring is None:
+        return
+    try:
+        monitoring.report(
+            node=node,
+            invocation=invocation,
+            node_sequence=node_sequence,
+            status=status,
+            observation_trace_id=observation_trace_id,
+            error_code=error_code,
+        )
+    except Exception:
+        pass
 
 
 def _port_router(

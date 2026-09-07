@@ -17,6 +17,7 @@ from .graph_builder import (
 )
 from .natural_cms_domain_client import NaturalCmsDomainClient, NaturalCmsJob
 from .node_runtime import NodeRegistry
+from .monitoring_client import NodeMonitoringReporter
 from .observability import AxmsObservability
 from .snapshot import VersionedSnapshot
 
@@ -34,6 +35,7 @@ class NaturalCmsSnapshotRunner:
         "_registry",
         "_checkpointer",
         "_observability",
+        "_monitoring",
     )
 
     def __init__(
@@ -43,6 +45,7 @@ class NaturalCmsSnapshotRunner:
         registry: NodeRegistry,
         checkpointer: Any,
         observability: AxmsObservability | None = None,
+        monitoring: NodeMonitoringReporter | None = None,
     ) -> None:
         if not callable(getattr(jobs, "resolve_job", None)):
             raise TypeError("jobs must implement resolve_job(job)")
@@ -57,6 +60,7 @@ class NaturalCmsSnapshotRunner:
         self._registry = registry
         self._checkpointer = checkpointer
         self._observability = observability or AxmsObservability()
+        self._monitoring = monitoring
 
     def invoke(self, reference: QueuedJobReference) -> Mapping[str, Any]:
         if not isinstance(reference, QueuedJobReference):
@@ -90,7 +94,7 @@ class NaturalCmsSnapshotRunner:
         digest = "sha256:" + hashlib.sha256(snapshot.to_json()).hexdigest()
         try:
             graph = SnapshotGraphBuilder(
-                self._registry, self._observability
+                self._registry, self._observability, self._monitoring
             ).compile(
                 snapshot,
                 checkpointer=self._checkpointer,
