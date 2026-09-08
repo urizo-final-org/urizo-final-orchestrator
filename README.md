@@ -59,8 +59,8 @@ the source-owned common contracts plus the AI04 `coding.analyze`, `coding.code`,
 `coding.preview_approval`, `coding.pr_request`, and `coding.deploy_request`
 contracts. AI04 stage handlers validate the exact Spring attempt/result shape,
 record only their current Result Port, and never choose the next node. The
-production stage executor consumes an exact Backend-prepared result and fails
-closed with `HANDLER_RESULT_NOT_FOUND` when none exists. The Backend
+production stage executor calls Spring through
+`SpringGatewayCodingStageExecutor`. The Backend
 `CodingHandlerStageService` handles `coding.analyze` through a structured Model
 Turn and returns the first stage result; the Orchestrator validates and records
 that result without taking over Spring's Model or Tool authority. The current
