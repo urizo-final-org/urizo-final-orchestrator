@@ -59,13 +59,13 @@ the source-owned common contracts plus the AI04 `coding.analyze`, `coding.code`,
 `coding.preview_approval`, `coding.pr_request`, and `coding.deploy_request`
 contracts. AI04 stage handlers validate the exact Spring attempt/result shape,
 record only their current Result Port, and never choose the next node. The
-production stage executor consumes an exact Backend-prepared result and fails
-closed with `HANDLER_RESULT_NOT_FOUND` when none exists. No approved component
-currently produces the first `coding.analyze` result, so a fresh production
-AI04 Job remains blocked pending a stage execution/result-production contract;
-the injected-executor tests prove the graph contract, not production execution.
-The current Coding runner remains available behind its compatibility Adapter
-for legacy regression only.
+production stage executor calls Spring through
+`SpringGatewayCodingStageExecutor`. The Backend
+`CodingHandlerStageService` handles `coding.analyze` through a structured Model
+Turn and returns the first stage result; the Orchestrator validates and records
+that result without taking over Spring's Model or Tool authority. The current
+Coding runner remains available behind its compatibility Adapter for legacy
+regression only.
 
 Spring marks `resume=true` only for the exact `WAITING_APPROVAL` to `RUNNING`
 approval transition. Higher `executionAttempt` deliveries are technical retries
@@ -165,21 +165,10 @@ approved local secrets are present:
 .\scripts\verify-full-local-failure-gates.ps1 -ConfirmFailureInjection
 ```
 
-Those gates own the seven-service Compose topology, Flyway one-shot execution,
+Those gates own the integrated Compose topology, Flyway one-shot execution,
 Frontend-through-Nginx routing, Spring/Core DB/Valkey integration, the coding
 Job interrupt/resume lifecycle, preserved-volume restart/idempotency, and
 bounded dependency failure/recovery checks.
-
-Latest verified Orchestrator evidence:
-
-- Python contract/runtime suite: 217 total, 215 passed, and 2 optional Valkey
-  integration tests skipped because `AXMS_TEST_VALKEY_PORT` was not configured.
-- Syntax gate: 47 Python files parsed successfully.
-- The frozen `uv.lock` image built with Python 3.12.13 and ran as non-root UID
-  10001.
-- Full Compose `coding-runtime` returned HTTP 200 from both `/health/live` and
-  `/health/ready`; Checkpoint PostgreSQL, Valkey queue, Spring, and the worker
-  loop all reported `UP`.
 
 The Backend script `scripts/verify-local-model-turn-roundtrip.ps1` is a
 supplementary Model Turn contract smoke, not the primary full-profile gate. It
