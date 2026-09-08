@@ -241,6 +241,12 @@ class _ScriptedExecutor:
                 if result.handler_key == "coding.pr_request"
                 and result.result_port == "requested"
             )
+            preview = next(
+                result
+                for result in reversed(attempt.results)
+                if result.handler_key == "coding.preview"
+                and result.result_port == "ready"
+            )
             return CodingStageOutcome(
                 "completed",
                 {
@@ -249,10 +255,15 @@ class _ScriptedExecutor:
                     "head": "system/llmops-" + ("a" * 32),
                     "headSha": "sha1:" + ("a" * 40),
                     "candidateSha": request.candidate_sha,
+                    "validationHash": request.validation_hash,
                     "prNumber": 42,
                     "prUrl": "https://github.example/pr/42",
+                    "state": "OPEN",
+                    "authorLogin": "axms-llmops[bot]",
+                    "reused": False,
                 },
                 candidate_sha=request.candidate_sha,
+                diff_digest=preview.diff_digest,
                 validation_hash=request.validation_hash,
             )
         if handler_key == "coding.deploy_request":

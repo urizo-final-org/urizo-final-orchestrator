@@ -36,6 +36,22 @@ MERGE_SHA = "sha1:" + ("c" * 40)
 DEPLOY_DIGEST = "sha256:" + ("d" * 64)
 
 
+def _pr_complete_payload(repository: str = "backend") -> dict[str, object]:
+    return {
+        "repository": repository,
+        "base": "dev",
+        "head": "system/llmops-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "headSha": SHA_B,
+        "candidateSha": SHA,
+        "validationHash": DIGEST,
+        "prNumber": 42,
+        "prUrl": "https://github.example/pr/42",
+        "state": "OPEN",
+        "authorLogin": "axms-llmops[bot]",
+        "reused": False,
+    }
+
+
 def _invocation(
     node_id: str,
     *,
@@ -254,6 +270,143 @@ class _GatewayDomain(_Domain):
 
 
 class CodingStageHandlerTest(unittest.TestCase):
+    def test_pr_complete_accepts_backend_and_frontend_bot_receipts(self) -> None:
+        for repository in ("backend", "frontend"):
+            with self.subTest(repository=repository):
+                payload = _pr_complete_payload(repository)
+                payload["reused"] = repository == "frontend"
+                if payload["reused"]:
+                    payload["state"] = "MERGED"
+                domain = _Domain(_subject_aggregate(include_deploy=False))
+                executor = _FixedExecutor(
+                    CodingStageOutcome(
+                        "completed",
+                        payload,
+                        candidate_sha=SHA,
+                        diff_digest=DIGEST,
+                        validation_hash=DIGEST,
+                    )
+                )
+                handler = register_coding_node_handlers(
+                    NodeRegistry(), CodingHandlerDependencies(domain, executor)
+                ).resolve("coding.pr_complete").handler
+
+                result = handler(_invocation("pr_complete"))
+
+                self.assertEqual("completed", result.port)
+                self.assertEqual(repository, domain.writes[0].payload["repository"])
+                self.assertEqual(
+                    "axms-llmops[bot]", domain.writes[0].payload["authorLogin"]
+                )
+
+    def test_pr_complete_rejects_invalid_receipt_before_put(self) -> None:
+        cases = (
+            ("repository", {"repository": "mcp-server"}, DIGEST),
+            ("base", {"base": "main"}, DIGEST),
+            ("head", {"head": "system/llmops-Agent_1"}, DIGEST),
+            ("candidate", {"candidateSha": SHA_B}, DIGEST),
+            ("validation", {"validationHash": DEPLOY_DIGEST}, DIGEST),
+            ("head-sha", {"headSha": "not-a-sha"}, DIGEST),
+            ("pr-number", {"prNumber": True}, DIGEST),
+            ("pr-url", {"prUrl": ""}, DIGEST),
+            ("state", {"state": "CLOSED"}, DIGEST),
+            ("author", {"authorLogin": "personal-user"}, DIGEST),
+            ("reused", {"reused": 1}, DIGEST),
+            ("diff-digest", {}, None),
+        )
+        for name, changes, diff_digest in cases:
+            with self.subTest(name=name):
+                payload = _pr_complete_payload()
+                payload.update(changes)
+                domain = _Domain(_subject_aggregate(include_deploy=False))
+                executor = _FixedExecutor(
+                    CodingStageOutcome(
+                        "completed",
+                        payload,
+                        candidate_sha=SHA,
+                        diff_digest=diff_digest,
+                        validation_hash=DIGEST,
+                    )
+                )
+                handler = register_coding_node_handlers(
+                    NodeRegistry(), CodingHandlerDependencies(domain, executor)
+                ).resolve("coding.pr_complete").handler
+
+                with self.assertRaises(GraphExecutionError) as raised:
+                    handler(_invocation("pr_complete"))
+
+                self.assertEqual("CONTRACT_VALIDATION_FAILED", raised.exception.code)
+                self.assertEqual([], domain.writes)
+
+    def test_frontend_pull_request_cannot_enter_backend_deployment_handlers(self) -> None:
+        base = _subject_aggregate()
+        pull_complete = _record(
+            result_id=str(uuid5(NAMESPACE_URL, "frontend-pr-complete")),
+            handler_key="coding.pr_complete",
+            result_type="PULL_REQUEST",
+            result_port="completed",
+            candidate_sha=SHA,
+            diff_digest=DIGEST,
+            validation_hash=DIGEST,
+            payload=_pr_complete_payload("frontend"),
+        )
+        deploy_request = _record(
+            result_id=str(uuid5(NAMESPACE_URL, "frontend-deploy-request")),
+            handler_key="coding.deploy_request",
+            result_type="DEPLOY_REQUEST",
+            result_port="recorded",
+            candidate_sha=SHA,
+            validation_hash=DIGEST,
+            payload={
+                "deploymentRequestId": "81818181-8181-4181-8181-818181818181",
+                "repository": "frontend",
+                "prNumber": 42,
+            },
+        )
+        cases = (
+            (
+                "coding.deploy_request",
+                "deploy_request",
+                {"mode": "request_record_only"},
+                _aggregate(
+                    results=base.results + (pull_complete,),
+                    decisions=base.decisions,
+                ),
+            ),
+            (
+                "coding.dev_merge_check",
+                "dev_merge_check",
+                {},
+                _aggregate(
+                    results=base.results + (pull_complete, deploy_request),
+                    decisions=base.decisions,
+                ),
+            ),
+            (
+                "coding.deploy",
+                "deploy",
+                {},
+                _aggregate(
+                    results=base.results + (pull_complete, deploy_request),
+                    decisions=base.decisions,
+                ),
+            ),
+        )
+        for handler_key, node_id, config, aggregate in cases:
+            with self.subTest(handler_key=handler_key):
+                domain = _Domain(aggregate)
+                executor = _FixedExecutor(CodingStageOutcome("completed"))
+                handler = register_coding_node_handlers(
+                    NodeRegistry(), CodingHandlerDependencies(domain, executor)
+                ).resolve(handler_key).handler
+
+                with self.assertRaises(GraphExecutionError) as raised:
+                    handler(_invocation(node_id, config=config))
+
+                self.assertEqual("CONTRACT_VALIDATION_FAILED", raised.exception.code)
+                self.assertEqual([], executor.result_ids)
+                self.assertEqual([], domain.writes)
+
     def test_external_side_effects_stop_before_executor_without_latest_approval(self) -> None:
         base = _subject_aggregate(include_deploy=False)
         pull_complete = _record(
