@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Protocol
 from uuid import NAMESPACE_URL, uuid5
@@ -71,6 +72,9 @@ _EMPTY_CONFIG_HANDLERS = frozenset(
         "coding.deploy",
     }
 )
+_PULL_REQUEST_REPOSITORIES = frozenset({"backend", "frontend"})
+_SYSTEM_LLMOPS_HEAD = re.compile(r"system/llmops-[a-z0-9][a-z0-9-]*")
+_GITHUB_APP_BOT_LOGIN = re.compile(r"[a-z0-9][a-z0-9-]*\[bot\]")
 
 
 class CodingHandlerFailure(RuntimeError):
@@ -604,9 +608,11 @@ def _stage_required_subject(
         _require_approved_decision(aggregate, "DEPLOY", deploy_subject)
         return _result_subject(pull_request)
     if handler_key == "coding.deploy_request" and _has_completed_pull_request(aggregate):
-        pull_request_subject = _latest_result_subject(
+        pull_request = _latest_result(
             aggregate, "coding.pr_complete", "PULL_REQUEST", "completed"
         )
+        _require_backend_pull_request(pull_request)
+        pull_request_subject = _result_subject(pull_request)
         _require_approved_decision(aggregate, "GITHUB", pull_request_subject)
         return None
     if handler_key == "coding.deploy_request":
@@ -672,11 +678,13 @@ def _validate_stage_outcome_contract(
     payload = outcome.payload
     if handler_key == "coding.pr_complete":
         if (
-            payload.get("repository") != "backend"
+            payload.get("repository") not in _PULL_REQUEST_REPOSITORIES
             or payload.get("base") != "dev"
             or payload.get("candidateSha") != outcome.candidate_sha
+            or payload.get("validationHash") != outcome.validation_hash
+            or not isinstance(outcome.diff_digest, str)
             or not isinstance(payload.get("head"), str)
-            or not payload["head"].startswith("system/llmops-")
+            or _SYSTEM_LLMOPS_HEAD.fullmatch(payload["head"]) is None
             or not isinstance(payload.get("headSha"), str)
             or GIT_OBJECT_ID.fullmatch(payload["headSha"]) is None
             or isinstance(payload.get("prNumber"), bool)
@@ -684,6 +692,10 @@ def _validate_stage_outcome_contract(
             or payload["prNumber"] < 1
             or not isinstance(payload.get("prUrl"), str)
             or not payload["prUrl"]
+            or payload.get("state") not in {"OPEN", "MERGED"}
+            or not isinstance(payload.get("authorLogin"), str)
+            or _GITHUB_APP_BOT_LOGIN.fullmatch(payload["authorLogin"]) is None
+            or not isinstance(payload.get("reused"), bool)
         ):
             raise ValueError("pull request receipt is invalid")
     elif handler_key == "coding.dev_merge_check":
@@ -827,13 +839,20 @@ def _latest_v4_deploy_request(aggregate: CodingAttemptAggregate) -> Any:
 
 
 def _require_matching_pr_identity(pull_request: Any, deploy_request: Any) -> None:
+    _require_backend_pull_request(pull_request)
     if (
-        pull_request.candidate_sha != deploy_request.candidate_sha
+        deploy_request.payload.get("repository") != "backend"
+        or pull_request.candidate_sha != deploy_request.candidate_sha
         or pull_request.payload.get("repository")
         != deploy_request.payload.get("repository")
         or pull_request.payload.get("prNumber") != deploy_request.payload.get("prNumber")
     ):
         raise ValueError("deployment request changed the completed pull request")
+
+
+def _require_backend_pull_request(pull_request: Any) -> None:
+    if pull_request.payload.get("repository") != "backend":
+        raise ValueError("deployment requires a backend pull request")
 
 
 def _has_completed_pull_request(aggregate: CodingAttemptAggregate) -> bool:
