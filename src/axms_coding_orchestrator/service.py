@@ -36,6 +36,7 @@ from .model_gateway import (
     ModelGatewayClient,
     ModelGatewayRemoteError,
 )
+from .monitoring_client import SpringNodeMonitoringReporter
 from .natural_cms_domain_client import (
     NaturalCmsDomainClientError,
     SpringNaturalCmsDomainClient,
@@ -576,6 +577,9 @@ def main() -> None:
             settings.spring_credential_file
         )
         worker_api = WorkerApiClient(settings.spring_origin, credential_resolver)
+        monitoring = SpringNodeMonitoringReporter(
+            settings.spring_origin, credential_resolver
+        )
         heartbeat = LeaseHeartbeatManager(
             worker_api, settings.heartbeat_seconds
         )
@@ -637,6 +641,7 @@ def main() -> None:
             coding_registry,
             checkpoint.checkpointer,
             observability,
+            monitoring,
         )
         graph = ProfileBoundWorkerGraphRouter(legacy_graph, snapshot_graph)
         coding_loop = WorkerLoop(
@@ -658,6 +663,7 @@ def main() -> None:
                 natural_cms_registry,
                 checkpoint.checkpointer,
                 observability,
+                monitoring,
             ),
             health,
             queue_block_seconds=settings.queue_block_seconds,

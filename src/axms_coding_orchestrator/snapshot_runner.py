@@ -19,6 +19,7 @@ from .graph_builder import (
     SnapshotGraphExecutionError,
 )
 from .node_runtime import NodeRegistry
+from .monitoring_client import NodeMonitoringReporter
 from .observability import AxmsObservability
 from .snapshot import VersionedSnapshot
 
@@ -175,7 +176,13 @@ class SnapshotExecution(_FactoryOnly):
 class SnapshotGraphRunner:
     """Run provider-resolved Snapshots through the existing Worker surface."""
 
-    __slots__ = ("_provider", "_registry", "_checkpointer", "_observability")
+    __slots__ = (
+        "_provider",
+        "_registry",
+        "_checkpointer",
+        "_observability",
+        "_monitoring",
+    )
 
     def __init__(
         self,
@@ -183,6 +190,7 @@ class SnapshotGraphRunner:
         registry: NodeRegistry,
         checkpointer: Any,
         observability: AxmsObservability | None = None,
+        monitoring: NodeMonitoringReporter | None = None,
     ) -> None:
         if not callable(getattr(provider, "resolve", None)):
             raise TypeError("provider must implement resolve(event)")
@@ -194,6 +202,7 @@ class SnapshotGraphRunner:
         self._registry = registry
         self._checkpointer = checkpointer
         self._observability = observability or AxmsObservability()
+        self._monitoring = monitoring
 
     def is_duplicate(self, event: CodingJobRequested) -> bool:
         try:
@@ -362,7 +371,7 @@ class SnapshotGraphRunner:
         digest = "sha256:" + hashlib.sha256(execution.snapshot.to_json()).hexdigest()
         try:
             graph = SnapshotGraphBuilder(
-                self._registry, self._observability
+                self._registry, self._observability, self._monitoring
             ).compile(
                 execution.snapshot,
                 checkpointer=self._checkpointer,

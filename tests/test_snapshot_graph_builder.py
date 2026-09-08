@@ -4,6 +4,9 @@ from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 import unittest
 
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command, interrupt
+
 from axms_coding_orchestrator.graph_builder import (
     SnapshotGraphBuildError,
     SnapshotGraphBuilder,
@@ -51,6 +54,31 @@ class _ObservationProbe:
             {"nodeId": invocation.node_id, "nodeStatus": "COMPLETED"}
         )
         return result
+
+
+class _MonitoringProbe:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.calls = 0
+        self.fail = fail
+        self.records: list[dict[str, Any]] = []
+
+    def report(self, **report: Any) -> bool:
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("FORBIDDEN_MONITORING_FAILURE")
+        node = report["node"]
+        invocation = report["invocation"]
+        self.records.append(
+            {
+                "nodeId": invocation.node_id,
+                "nodeType": node.node_type,
+                "nodeSequence": report["node_sequence"],
+                "status": report["status"],
+                "observationTraceId": report["observation_trace_id"],
+                "errorCode": report["error_code"],
+            }
+        )
+        return True
 
 
 def _node(
@@ -287,6 +315,117 @@ def _linear_handlers(
 
 
 class SnapshotGraphBuilderTest(unittest.TestCase):
+    def test_reports_each_linear_node_with_one_monotonic_sequence(self) -> None:
+        snapshot = _linear_snapshot()
+        log: list[tuple[str, NodeInvocation]] = []
+        monitoring = _MonitoringProbe()
+        graph = SnapshotGraphBuilder(
+            _registry(snapshot, _linear_handlers(log)),
+            monitoring=monitoring,  # type: ignore[arg-type]
+        ).compile(snapshot)
+
+        graph.invoke(_state())
+
+        self.assertEqual(
+            [
+                ("fixture_start", 1, "RUNNING"),
+                ("fixture_start", 1, "COMPLETED"),
+                ("fixture_guardrail", 2, "RUNNING"),
+                ("fixture_guardrail", 2, "COMPLETED"),
+                ("fixture_work", 3, "RUNNING"),
+                ("fixture_work", 3, "COMPLETED"),
+                ("fixture_end", 4, "RUNNING"),
+                ("fixture_end", 4, "COMPLETED"),
+            ],
+            [
+                (row["nodeId"], row["nodeSequence"], row["status"])
+                for row in monitoring.records
+            ],
+        )
+        self.assertTrue(
+            all(row["observationTraceId"] is None for row in monitoring.records)
+        )
+
+    def test_reports_only_an_actual_node_failure_as_failed(self) -> None:
+        class ExpectedFailure(RuntimeError):
+            pass
+
+        snapshot = _linear_snapshot()
+        log: list[tuple[str, NodeInvocation]] = []
+        monitoring = _MonitoringProbe()
+
+        def fail(invocation: NodeInvocation) -> NodeResult:
+            log.append(("fixture.work", invocation))
+            raise ExpectedFailure("FORBIDDEN_FAILURE_DETAIL")
+
+        graph = SnapshotGraphBuilder(
+            _registry(snapshot, _linear_handlers(log, work=fail)),
+            monitoring=monitoring,  # type: ignore[arg-type]
+        ).compile(snapshot)
+
+        with self.assertRaises(ExpectedFailure):
+            graph.invoke(_state())
+
+        self.assertEqual(
+            ("fixture_work", 3, "FAILED", "NODE_EXECUTION_FAILED"),
+            (
+                monitoring.records[-1]["nodeId"],
+                monitoring.records[-1]["nodeSequence"],
+                monitoring.records[-1]["status"],
+                monitoring.records[-1]["errorCode"],
+            ),
+        )
+        self.assertNotIn("FORBIDDEN_FAILURE_DETAIL", repr(monitoring.records))
+
+    def test_monitoring_failure_does_not_change_the_business_result(self) -> None:
+        snapshot = _linear_snapshot()
+        log: list[tuple[str, NodeInvocation]] = []
+        monitoring = _MonitoringProbe(fail=True)
+        graph = SnapshotGraphBuilder(
+            _registry(snapshot, _linear_handlers(log)),
+            monitoring=monitoring,  # type: ignore[arg-type]
+        ).compile(snapshot)
+
+        completed = graph.invoke(_state())
+
+        self.assertEqual("complete", completed["context"]["fixture_value"])
+        self.assertEqual(8, monitoring.calls)
+
+    def test_approval_resume_reuses_the_interrupted_occurrence_sequence(self) -> None:
+        snapshot = _linear_snapshot()
+        log: list[tuple[str, NodeInvocation]] = []
+        monitoring = _MonitoringProbe()
+        pending = {"approvalId": "fixture-approval"}
+
+        def pause(invocation: NodeInvocation) -> NodeResult:
+            resumed = interrupt(pending)
+            log.append(("fixture.work", invocation))
+            return NodeResult.create(
+                "fixture_done", {"fixture_resume_seen": resumed is not None}
+            )
+
+        graph = SnapshotGraphBuilder(
+            _registry(snapshot, _linear_handlers(log, work=pause)),
+            monitoring=monitoring,  # type: ignore[arg-type]
+        ).compile(snapshot, InMemorySaver())
+        config = {"configurable": {"thread_id": JOB_ID}}
+
+        waiting = graph.invoke(_state(), config)
+        completed = graph.invoke(Command(resume={"approved": True}), config)
+
+        self.assertIn("__interrupt__", waiting)
+        self.assertTrue(completed["context"]["fixture_resume_seen"])
+        work = [row for row in monitoring.records if row["nodeId"] == "fixture_work"]
+        self.assertEqual(
+            [(3, "RUNNING"), (3, "WAITING_APPROVAL"),
+             (3, "RUNNING"), (3, "COMPLETED")],
+            [(row["nodeSequence"], row["status"]) for row in work],
+        )
+        self.assertEqual(
+            (4, "COMPLETED"),
+            (monitoring.records[-1]["nodeSequence"], monitoring.records[-1]["status"]),
+        )
+
     def test_compiles_and_executes_a_linear_fixture_graph(self) -> None:
         snapshot = _linear_snapshot()
         log: list[tuple[str, NodeInvocation]] = []

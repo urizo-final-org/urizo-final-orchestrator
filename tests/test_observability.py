@@ -112,6 +112,7 @@ def _invocation(node_id: str = "analyze") -> SimpleNamespace:
         trace_id=TRACE_ID,
         profile_version_id=PROFILE_VERSION_ID,
         node_id=node_id,
+        pipeline_attempt=1,
         execution_attempt=2,
         context={
             "prompt": "FORBIDDEN_PROMPT",
@@ -122,6 +123,33 @@ def _invocation(node_id: str = "analyze") -> SimpleNamespace:
 
 
 class ObservabilityTest(unittest.TestCase):
+    def test_exposes_only_native_trace_id_and_string_occurrence_metadata_in_scope(
+        self,
+    ) -> None:
+        client = _FakeClient()
+        observability = AxmsObservability(client)
+
+        self.assertIsNone(observability.current_trace_id())
+        with observability.job(
+            job_id=JOB_ID,
+            trace_id=TRACE_ID,
+            profile_version_id=PROFILE_VERSION_ID,
+            attempt=1,
+        ):
+            self.assertEqual("a" * 32, observability.current_trace_id())
+            observability.invoke_node(
+                node=SimpleNamespace(node_type="agent"),
+                invocation=_invocation(),
+                handler=lambda _invocation: SimpleNamespace(port="completed"),
+                node_sequence=7,
+            )
+        self.assertIsNone(observability.current_trace_id())
+
+        node = next(item for item in client.observations if item.name == "axms.node")
+        self.assertEqual("1", node.metadata["pipelineAttempt"])
+        self.assertEqual("2", node.metadata["executionAttempt"])
+        self.assertEqual("7", node.metadata["nodeSequence"])
+
     def test_environment_activation_is_exact_and_initialization_is_fail_open(self) -> None:
         calls: list[dict[str, object]] = []
 
