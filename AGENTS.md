@@ -4,7 +4,7 @@
 
 - This file is a repository entry point, not a copy of team policy.
 - Cross-repository policy, roles, Wave/WBS state, assignments, Git/PR workflow, and shared safety rules are owned only by the sibling `../urizo-final-master/AGENTS.md` and its required current-status documents.
-- Before planning or editing, read that Master authority from the canonical parent workspace. If the sibling Master checkout is unavailable, do not infer current work from this repository alone; reopen the canonical four-repository workspace or synchronize Master first.
+- Before planning or editing, read that Master authority from the canonical parent workspace. If the sibling Master checkout is unavailable, do not infer current work from this repository alone; reopen the canonical five-repository workspace or synchronize Master first.
 - Claude Code uses `CLAUDE.md`, which imports this file. Do not add a second copy of common policy there.
 
 ## Repository-local scope
