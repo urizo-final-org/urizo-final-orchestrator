@@ -716,6 +716,40 @@ class CodingStageHandlerTest(unittest.TestCase):
         self.assertEqual("ready", domain.writes[0].result_port)
         self.assertNotIn("artifactRef", first.updates["codingLastResult"])
 
+    def test_the_reviewers_denied_area_report_reaches_the_graph_state(self) -> None:
+        # The gate decides on this reference; it never sees the payload the field
+        # arrives in. Only a real boolean travels, so a profile that does not
+        # report it leaves the gate with the round budget it always had.
+        cases = (
+            ({"reportSummary": "됨", "requiresDeniedArea": True}, True),
+            ({"reportSummary": "됨", "requiresDeniedArea": False}, False),
+            ({"reportSummary": "됨"}, None),
+            ({"reportSummary": "됨", "requiresDeniedArea": "true"}, None),
+        )
+        for payload, expected in cases:
+            with self.subTest(payload=payload):
+                domain = _Domain(_reviewed_aggregate(review_port="changes_requested"))
+                handler = register_coding_node_handlers(
+                    NodeRegistry(),
+                    CodingHandlerDependencies(
+                        domain,
+                        _FixedExecutor(
+                            CodingStageOutcome(
+                                "changes_requested", payload, candidate_sha=SHA
+                            )
+                        ),
+                    ),
+                ).resolve("coding.review").handler
+
+                reference = handler(_invocation("review")).updates["codingLastResult"]
+
+                if expected is None:
+                    self.assertNotIn("requiresDeniedArea", reference)
+                else:
+                    self.assertIs(expected, reference["requiresDeniedArea"])
+                # The rest of the payload still stays in Spring.
+                self.assertNotIn("reportSummary", reference)
+
     def test_review_result_must_match_latest_completed_code_candidate(self) -> None:
         source = _reviewed_aggregate()
         domain = _Domain(_aggregate(results=(source.results[0],)))
@@ -1181,6 +1215,93 @@ class CodingApprovalHandlerTest(unittest.TestCase):
             )
 
         self.assertEqual("rejected", result.port)
+
+
+class CodingReworkGateTest(unittest.TestCase):
+    """The gate spends a round only when another attempt could succeed.
+
+    Measured on Job c26fd4aa: the reviewer reported in its first round that the
+    request could only be finished by editing a file outside the job's guardrail
+    areas, the gate spent its remaining rounds anyway, and the post-check refused
+    the candidate the extra rounds produced - 73% of that job's tokens.
+    """
+
+    @staticmethod
+    def _gate():
+        return register_coding_node_handlers(
+            NodeRegistry(),
+            CodingHandlerDependencies(_Domain(_aggregate()), _FixedExecutor(None)),
+        ).resolve("coding.rework_gate").handler
+
+    def _run(self, context: dict[str, object]):
+        return self._gate()(  # type: ignore[operator]
+            _invocation(
+                "rework_gate", config={"maxReworkRounds": 3}, context=context
+            )
+        )
+
+    def test_a_reported_denied_area_hands_over_on_the_first_round(self) -> None:
+        result = self._run(
+            {
+                "codingLastResult": {
+                    "handlerKey": "coding.review",
+                    "requiresDeniedArea": True,
+                }
+            }
+        )
+
+        self.assertEqual("handover", result.port)
+
+    def test_an_ordinary_rejection_keeps_its_rounds(self) -> None:
+        result = self._run(
+            {
+                "codingLastResult": {
+                    "handlerKey": "coding.review",
+                    "requiresDeniedArea": False,
+                }
+            }
+        )
+
+        self.assertEqual("retry", result.port)
+
+    def test_a_state_without_the_field_keeps_its_rounds(self) -> None:
+        # A profile whose reviewer never reports the field, or a checkpoint
+        # written before the field existed, keeps the behaviour it had.
+        for context in (
+            {},
+            {"codingLastResult": {"handlerKey": "coding.review"}},
+            {"codingLastResult": "not a mapping"},
+            # Only the reviewer decides this; a stale reference from another
+            # stage must not end the job.
+            {
+                "codingLastResult": {
+                    "handlerKey": "coding.code",
+                    "requiresDeniedArea": True,
+                }
+            },
+            # A truthy value is not a reported boolean.
+            {
+                "codingLastResult": {
+                    "handlerKey": "coding.review",
+                    "requiresDeniedArea": "true",
+                }
+            },
+        ):
+            with self.subTest(context=context):
+                self.assertEqual("retry", self._run(context).port)
+
+    def test_the_round_budget_still_ends_an_ordinary_loop(self) -> None:
+        result = self._run(
+            {
+                "codingStageRounds": {"rework_gate": 3},
+                "codingLastResult": {
+                    "handlerKey": "coding.review",
+                    "requiresDeniedArea": False,
+                },
+            }
+        )
+
+        self.assertEqual("handover", result.port)
 
 
 if __name__ == "__main__":

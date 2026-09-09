@@ -260,6 +260,14 @@ def _rework_gate_handler() -> Any:
     handover screen with nothing to read. This gate keeps the same round budget
     but turns the final rejection into a declared port, so the Job finishes
     normally with the generated candidates and review reasons already recorded.
+
+    A round is worth spending only when another attempt could succeed. When the
+    reviewer reports that finishing the request needs a file outside the job's
+    guardrail areas, no attempt can: the post-check on the finished candidate
+    refuses exactly that. Measured on Job c26fd4aa, the reviewer said so in its
+    first round and the remaining rounds spent 73% of the job's tokens producing
+    a candidate that was then refused. Only that reported case skips the budget;
+    every other rejection keeps the rounds it has.
     """
 
     def handle(invocation: NodeInvocation) -> NodeResult:
@@ -270,6 +278,8 @@ def _rework_gate_handler() -> Any:
             round_number, rounds = _next_round(invocation)
         except (TypeError, ValueError):
             raise _contract_failure("The Coding stage returned an invalid result.") from None
+        if _requires_denied_area(invocation):
+            return NodeResult.create("handover", {"codingStageRounds": rounds})
         port = "retry" if round_number < maximum else "handover"
         return NodeResult.create(port, {"codingStageRounds": rounds})
 
@@ -368,6 +378,15 @@ def _stage_handler(
         result_reference.update(
             {key: value for key, value in optional.items() if value is not None}
         )
+        # The reviewer is the only stage that can tell "not finished yet" from "cannot be
+        # finished inside the fence", and both of those leave as changes_requested. The rework
+        # gate reads this reference rather than the payload it never sees, so the one field
+        # that separates them is carried here. Anything but a real boolean is left out: an
+        # absent field means the gate keeps its round budget, which is the behaviour that
+        # existed before the field did.
+        requires_denied_area = outcome.payload.get("requiresDeniedArea")
+        if isinstance(requires_denied_area, bool):
+            result_reference["requiresDeniedArea"] = requires_denied_area
         return NodeResult.create(
             outcome.port,
             {
@@ -931,6 +950,22 @@ def _validate_attempt(
         for result in aggregate.results
     ):
         raise ValueError("Coding result does not match the current attempt")
+
+
+def _requires_denied_area(invocation: NodeInvocation) -> bool:
+    """Whether the reviewer reported that finishing needs an area the fence denies.
+
+    Read from the last stage reference rather than the payload, which the graph
+    never carries. Anything other than a stored boolean True answers False, so a
+    profile whose reviewer does not report the field, or a state written before
+    the field existed, keeps the plain round budget.
+    """
+    reference = invocation.context.get("codingLastResult")
+    if not isinstance(reference, Mapping):
+        return False
+    if reference.get("handlerKey") != "coding.review":
+        return False
+    return reference.get("requiresDeniedArea") is True
 
 
 def _next_round(invocation: NodeInvocation) -> tuple[int, dict[str, int]]:
