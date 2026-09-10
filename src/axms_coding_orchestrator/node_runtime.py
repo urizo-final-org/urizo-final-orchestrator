@@ -177,6 +177,7 @@ class NodeHandlerRegistration(_FactoryOnly):
     handler_key: str
     node_types: frozenset[str]
     result_ports: frozenset[str]
+    legacy_result_ports: frozenset[str] | None
     handler: NodeHandler = field(repr=False, compare=False)
     config_validator: NodeConfigValidator = field(repr=False, compare=False)
 
@@ -197,6 +198,7 @@ class NodeRegistry:
         result_ports: Iterable[str],
         handler: NodeHandler,
         config_validator: NodeConfigValidator | None = None,
+        legacy_result_ports: Iterable[str] | None = None,
     ) -> NodeRegistry:
         try:
             key = _matched(handler_key, HANDLER_KEY, "registry.handlerKey", 128)
@@ -215,6 +217,8 @@ class NodeRegistry:
         object.__setattr__(registration, "handler_key", key)
         object.__setattr__(registration, "node_types", types)
         object.__setattr__(registration, "result_ports", ports)
+        object.__setattr__(registration, "legacy_result_ports", None if legacy_result_ports is None
+                           else _string_set(legacy_result_ports, "registry.resultPorts", None, RESULT_PORT))
         object.__setattr__(registration, "handler", handler)
         object.__setattr__(registration, "config_validator", validator)
         self._registrations[key] = registration

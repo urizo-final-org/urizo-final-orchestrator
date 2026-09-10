@@ -36,7 +36,7 @@ CODING_HANDLER_CONTRACTS: Mapping[str, tuple[frozenset[str], frozenset[str]]] = 
         frozenset({"approved", "rejected"}),
     ),
     "coding.pr_request": (frozenset({"tool"}), frozenset({"requested"})),
-    "coding.pr_complete": (frozenset({"tool"}), frozenset({"completed"})),
+    "coding.pr_complete": (frozenset({"tool"}), frozenset({"completed", "closed"})),
     "coding.dev_merge_check": (
         frozenset({"check"}),
         frozenset({"merged", "not_merged", "blocked"}),
@@ -67,7 +67,6 @@ _EMPTY_CONFIG_HANDLERS = frozenset(
         "coding.review",
         "coding.preview",
         "coding.pr_request",
-        "coding.pr_complete",
         "coding.dev_merge_check",
         "coding.deploy",
     }
@@ -226,6 +225,7 @@ def register_coding_node_handlers(
             result_ports=ports,
             handler=_stage_handler(handler_key, dependencies),
             config_validator=_stage_config_validator(handler_key),
+            legacy_result_ports=["completed"] if handler_key == "coding.pr_complete" else None,
         )
     registry.register(
         "coding.approval",
@@ -325,6 +325,15 @@ def _stage_handler(
             ):
                 raise ValueError("Coding stage result changed the reviewed candidate")
             _validate_stage_outcome_contract(handler_key, aggregate, outcome)
+            node_port = outcome.port
+            if handler_key == "coding.pr_complete":
+                if outcome.port != "completed":
+                    raise ValueError("PR receipt must record completion")
+                if invocation.config:
+                    supported = outcome.payload.get("deploymentSupported")
+                    if not isinstance(supported, bool):
+                        raise ValueError("PR receipt has no deployment capability")
+                    node_port = "completed" if supported else "closed"
             workspace_id = (
                 outcome.workspace_id
                 or aggregate.workspace_id
@@ -388,7 +397,7 @@ def _stage_handler(
         if isinstance(requires_denied_area, bool):
             result_reference["requiresDeniedArea"] = requires_denied_area
         return NodeResult.create(
-            outcome.port,
+            node_port,
             {
                 "codingStageRounds": rounds,
                 "codingLastResult": result_reference,
@@ -492,6 +501,10 @@ def _stage_config_validator(handler_key: str):
 def _stage_config_failure(
     handler_key: str, config: Mapping[str, Any]
 ) -> str | None:
+    if handler_key == "coding.pr_complete" and config not in (
+        {}, {"completionMode": "deployment-capability"},
+    ):
+        return "coding.pr_complete config is invalid"
     if handler_key in _EMPTY_CONFIG_HANDLERS and config:
         return f"{handler_key} does not accept node config"
     if handler_key == "coding.deploy_request" and config != {

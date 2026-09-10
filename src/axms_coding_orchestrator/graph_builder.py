@@ -93,7 +93,11 @@ class SnapshotGraphBuilder:
                 raise SnapshotGraphBuildError(
                     f"node '{node.node_id}' type does not match its registered handler"
                 )
-            if frozenset(node.result_ports) != registration.result_ports:
+            # Explicit source-registered legacy contracts remain valid for immutable Jobs.
+            expected_ports = (registration.legacy_result_ports
+                              if not node.config and registration.legacy_result_ports is not None
+                              else registration.result_ports)
+            if frozenset(node.result_ports) != expected_ports:
                 raise SnapshotGraphBuildError(
                     f"node '{node.node_id}' result ports do not match its registered handler"
                 )
