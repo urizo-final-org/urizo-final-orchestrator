@@ -643,7 +643,7 @@ def _stage_required_subject(
         pull_request = _latest_result(
             aggregate, "coding.pr_complete", "PULL_REQUEST", "completed"
         )
-        _require_backend_pull_request(pull_request)
+        _require_deployable_pull_request(pull_request)
         pull_request_subject = _result_subject(pull_request)
         _require_approved_decision(aggregate, "GITHUB", pull_request_subject)
         return None
@@ -773,7 +773,7 @@ def _validate_stage_outcome_contract(
             or payload.get("pipelineAttempt") != aggregate.pipeline_attempt
             or payload.get("candidateSha") != pull_request.candidate_sha
             or payload.get("sourceValidationHash") != pull_request.validation_hash
-            or payload.get("repository") != "backend"
+            or payload.get("repository") not in _PULL_REQUEST_REPOSITORIES
             or not isinstance(payload.get("deploymentRequestId"), str)
             or not isinstance(outcome.validation_hash, str)
         ):
@@ -871,9 +871,9 @@ def _latest_v4_deploy_request(aggregate: CodingAttemptAggregate) -> Any:
 
 
 def _require_matching_pr_identity(pull_request: Any, deploy_request: Any) -> None:
-    _require_backend_pull_request(pull_request)
+    _require_deployable_pull_request(pull_request)
     if (
-        deploy_request.payload.get("repository") != "backend"
+        deploy_request.payload.get("repository") not in _PULL_REQUEST_REPOSITORIES
         or pull_request.candidate_sha != deploy_request.candidate_sha
         or pull_request.payload.get("repository")
         != deploy_request.payload.get("repository")
@@ -882,9 +882,11 @@ def _require_matching_pr_identity(pull_request: Any, deploy_request: Any) -> Non
         raise ValueError("deployment request changed the completed pull request")
 
 
-def _require_backend_pull_request(pull_request: Any) -> None:
-    if pull_request.payload.get("repository") != "backend":
-        raise ValueError("deployment requires a backend pull request")
+def _require_deployable_pull_request(pull_request: Any) -> None:
+    # The server decides which repositories have a deployment target; the graph only
+    # refuses a pull request from a repository it never publishes at all.
+    if pull_request.payload.get("repository") not in _PULL_REQUEST_REPOSITORIES:
+        raise ValueError("deployment requires a pull request from a deployable repository")
 
 
 def _has_completed_pull_request(aggregate: CodingAttemptAggregate) -> bool:

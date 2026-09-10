@@ -433,20 +433,22 @@ class CodingStageHandlerTest(unittest.TestCase):
                 self.assertEqual("CONTRACT_VALIDATION_FAILED", raised.exception.code)
                 self.assertEqual([], domain.writes)
 
-    def test_frontend_pull_request_cannot_enter_backend_deployment_handlers(self) -> None:
+    def test_unknown_repository_pull_request_cannot_enter_deployment_handlers(self) -> None:
+        # Both published repositories may deploy; a pull request naming any other
+        # repository never reaches the deployment handlers.
         base = _subject_aggregate()
         pull_complete = _record(
-            result_id=str(uuid5(NAMESPACE_URL, "frontend-pr-complete")),
+            result_id=str(uuid5(NAMESPACE_URL, "unknown-pr-complete")),
             handler_key="coding.pr_complete",
             result_type="PULL_REQUEST",
             result_port="completed",
             candidate_sha=SHA,
             diff_digest=DIGEST,
             validation_hash=DIGEST,
-            payload=_pr_complete_payload("frontend"),
+            payload=_pr_complete_payload("mcp-server"),
         )
         deploy_request = _record(
-            result_id=str(uuid5(NAMESPACE_URL, "frontend-deploy-request")),
+            result_id=str(uuid5(NAMESPACE_URL, "unknown-deploy-request")),
             handler_key="coding.deploy_request",
             result_type="DEPLOY_REQUEST",
             result_port="recorded",
@@ -454,7 +456,7 @@ class CodingStageHandlerTest(unittest.TestCase):
             validation_hash=DIGEST,
             payload={
                 "deploymentRequestId": "81818181-8181-4181-8181-818181818181",
-                "repository": "frontend",
+                "repository": "mcp-server",
                 "prNumber": 42,
             },
         )
