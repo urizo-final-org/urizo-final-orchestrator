@@ -72,6 +72,9 @@ class DefaultCodingSnapshotTest(unittest.TestCase):
         self.assertEqual(V4_CODING_HANDLERS, set(feature_nodes))
         for handler_key in V4_CODING_HANDLERS:
             _, ports = CODING_HANDLER_CONTRACTS[handler_key]
+            if handler_key == "coding.pr_complete":
+                # The immutable v4 seed retains its pre-capability single exit.
+                ports = frozenset({"completed"})
             self.assertEqual(ports, feature_nodes[handler_key])
 
         self.assertEqual({"analyze", "code", "review"}, set(snapshot.model_bindings))

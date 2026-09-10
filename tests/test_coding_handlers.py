@@ -20,7 +20,11 @@ from axms_coding_orchestrator.coding_handlers import (
     register_coding_node_handlers,
 )
 from axms_coding_orchestrator.graph import GraphExecutionError
-from axms_coding_orchestrator.node_runtime import NodeInvocation, NodeRegistry
+from axms_coding_orchestrator.node_runtime import NodeInvocation, NodeRegistry, NodeResult
+from axms_coding_orchestrator.common_handlers import build_common_node_registry
+from axms_coding_orchestrator.default_coding_snapshot import default_coding_snapshot_dict
+from axms_coding_orchestrator.graph_builder import SnapshotGraphBuilder, SnapshotGraphBuildError
+from axms_coding_orchestrator.snapshot import VersionedSnapshot
 
 
 JOB_ID = "20202020-2020-4020-8020-202020202020"
@@ -270,6 +274,97 @@ class _GatewayDomain(_Domain):
 
 
 class CodingStageHandlerTest(unittest.TestCase):
+    def test_pr_completion_routes_by_capability_without_changing_the_receipt(self) -> None:
+        # Repository names deliberately do not decide the route: the server capability does.
+        for repository, supported, expected in (
+            ("frontend", False, "closed"), ("backend", True, "completed"),
+            ("backend", False, "closed"), ("frontend", True, "completed"),
+        ):
+            with self.subTest(repository=repository, supported=supported):
+                payload = {**_pr_complete_payload(repository), "deploymentSupported": supported}
+                domain = _Domain(_subject_aggregate(include_deploy=False))
+                executor = _FixedExecutor(CodingStageOutcome(
+                    "completed", payload, candidate_sha=SHA,
+                    diff_digest=DIGEST, validation_hash=DIGEST,
+                ))
+                handler = register_coding_node_handlers(
+                    NodeRegistry(), CodingHandlerDependencies(domain, executor)
+                ).resolve("coding.pr_complete").handler
+                result = handler(_invocation("pr_complete", config={
+                    "completionMode": "deployment-capability",
+                }))
+                self.assertEqual(expected, result.port)
+                self.assertEqual("completed", domain.writes[0].result_port)
+                self.assertEqual("completed", result.updates["codingLastResult"]["resultPort"])
+
+    def test_capability_route_rejects_missing_or_non_boolean_capability(self) -> None:
+        for value in (None, "false", 0, 1):
+            with self.subTest(value=value):
+                payload = {**_pr_complete_payload("frontend"), "deploymentSupported": value}
+                domain = _Domain(_subject_aggregate(include_deploy=False))
+                handler = register_coding_node_handlers(NodeRegistry(), CodingHandlerDependencies(
+                    domain, _FixedExecutor(CodingStageOutcome(
+                        "completed", payload, candidate_sha=SHA,
+                        diff_digest=DIGEST, validation_hash=DIGEST,
+                    )),
+                )).resolve("coding.pr_complete").handler
+                with self.assertRaises(GraphExecutionError):
+                    handler(_invocation("pr_complete", config={
+                        "completionMode": "deployment-capability",
+                    }))
+                self.assertEqual([], domain.writes)
+
+    def test_compiled_snapshot_finishes_frontend_and_keeps_backend_deploy_tail(self) -> None:
+        for repository, supported in (("frontend", False), ("backend", True)):
+            with self.subTest(repository=repository):
+                snapshot = default_coding_snapshot_dict()
+                snapshot["profileVersionId"] = str(uuid5(NAMESPACE_URL, "AI04-019-test-profile"))
+                snapshot["profileVersion"] = 19
+                pr = next(node for node in snapshot["nodes"] if node["id"] == "pr_complete")
+                pr["resultPorts"] = ["completed", "closed"]
+                pr["config"] = {"completionMode": "deployment-capability"}
+                snapshot["edges"].append({"from": "pr_complete", "resultPort": "closed", "to": "end"})
+                domain = _Domain(_subject_aggregate(include_deploy=False))
+                payload = {**_pr_complete_payload(repository), "deploymentSupported": supported}
+                production = register_coding_node_handlers(build_common_node_registry(),
+                    CodingHandlerDependencies(domain, _FixedExecutor(CodingStageOutcome(
+                        "completed", payload, candidate_sha=SHA,
+                        diff_digest=DIGEST, validation_hash=DIGEST,
+                    ))))
+                calls = []
+                registry = NodeRegistry()
+                def wrapped(key, handler, port):
+                    def run(invocation):
+                        calls.append(invocation.node_id)
+                        return handler(invocation) if key == "coding.pr_complete" else NodeResult.create(port)
+                    return run
+                for key in production.registered_keys:
+                    registration = production.resolve(key)
+                    nodes = [node for node in snapshot["nodes"] if node["handlerKey"] == key]
+                    port = nodes[0]["resultPorts"][0] if nodes and nodes[0]["resultPorts"] else None
+                    registry.register(key, node_types=registration.node_types,
+                        result_ports=registration.result_ports,
+                        legacy_result_ports=registration.legacy_result_ports,
+                        config_validator=registration.config_validator,
+                        handler=wrapped(key, registration.handler, port))
+                graph = SnapshotGraphBuilder(registry).compile(VersionedSnapshot.from_dict(snapshot))
+                state = graph.invoke({"jobId": JOB_ID, "pipelineAttempt": 1,
+                    "profileVersionId": snapshot["profileVersionId"],
+                    "executionAttempt": 1, "stateVersion": 7, "traceId": TRACE_ID,
+                    "workspaceId": WORKSPACE_ID, "toolCallId": None, "context": {}})
+                self.assertEqual("end", state["_snapshotLastNodeId"])
+                self.assertEqual(supported, "deploy_request" in calls)
+                self.assertEqual(supported, "deploy_approval" in calls)
+                self.assertEqual(supported, "deploy" in calls)
+                self.assertEqual("completed", domain.writes[0].result_port)
+                if not supported:
+                    self.assertEqual(["pr_complete", "end"], calls[-2:])
+
+                # Config and port set must change together; arbitrary subsets stay invalid.
+                pr["config"] = {}
+                with self.assertRaises(SnapshotGraphBuildError):
+                    SnapshotGraphBuilder(registry).compile(VersionedSnapshot.from_dict(snapshot))
+
     def test_pr_complete_accepts_backend_and_frontend_bot_receipts(self) -> None:
         for repository in ("backend", "frontend"):
             with self.subTest(repository=repository):
