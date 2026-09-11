@@ -22,6 +22,20 @@ RESULT_ID = "44444444-4444-4444-8444-444444444444"
 
 
 class SpringNaturalCmsDomainClientTest(unittest.TestCase):
+    def test_job_accepts_optional_saved_preview_without_changing_execution_identity(self) -> None:
+        response = {"schemaVersion": "1.0", "jobId": JOB_ID, "traceId": TRACE_ID,
+                    "profileVersionId": PROFILE_VERSION_ID, "pipelineAttempt": 1, "stateVersion": 2,
+                    "status": "WAITING_APPROVAL", "requestText": "Update photos",
+                    "resource": {"type": "TEMPLATE", "id": "CLASSIC"}, "previewValid": True}
+        baseline = NaturalCmsJob.from_dict(response)
+        for preview in (None, {"before": {"heroImages": []}, "after": {"heroImages": []}}):
+            with self.subTest(preview=preview):
+                self.assertEqual(baseline, NaturalCmsJob.from_dict({**response, "preview": preview}))
+        with self.assertRaises(ValueError):
+            NaturalCmsJob.from_dict({**response, "preview": []})
+        with self.assertRaises(ValueError):
+            NaturalCmsJob.from_dict({**response, "unexpected": {}})
+
     def test_resource_accepts_supported_types_and_preserves_type(self) -> None:
         for resource_type in ("MENU", "BOARD", "CONTENT", "TEMPLATE"):
             with self.subTest(resource_type=resource_type):

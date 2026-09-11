@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 import unittest
 from uuid import uuid5, NAMESPACE_URL
+from unittest.mock import patch
 
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
@@ -163,6 +164,13 @@ def _state() -> dict[str, Any]:
 
 
 class DefaultNaturalCmsSnapshotTest(unittest.TestCase):
+    def test_template_images_use_the_same_snapshot_approval_and_retry_path(self) -> None:
+        command = {"operation": "UPDATE", "fields": {"heroImages": [
+            {"url": f"/api/site/images/{i}", "title": f"Photo {i}", "description": "Caption"} for i in range(1, 6)
+        ]}}
+        with patch(__name__ + ".RESOURCE", NaturalCmsResource("TEMPLATE", "CLASSIC")), patch(__name__ + ".COMMAND", command):
+            self.test_rejection_discards_then_retries_same_job_before_apply()
+
     def test_stage_contract_rejects_coding_only_fields(self) -> None:
         with self.assertRaises(ValueError):
             NaturalCmsStageResult.from_dict(
