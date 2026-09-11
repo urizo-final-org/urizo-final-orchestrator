@@ -89,7 +89,7 @@ class NaturalCmsJob:
         }
         allowed = required | {
             "requestText", "structuredCommand", "previewId", "previewHash",
-            "approvalDecision", "approvalFeedback", "createdAt", "updatedAt",
+            "approvalDecision", "approvalFeedback", "createdAt", "updatedAt", "preview",
         }
         if (
             not required.issubset(data)
@@ -98,6 +98,10 @@ class NaturalCmsJob:
         ):
             raise ValueError("job fields are invalid")
         preview_id = data.get("previewId")
+        # Backend serves the saved preview to the approval UI. Execution still uses
+        # the same profile snapshot and preview identity, never a UI-provided body.
+        if data.get("preview") is not None:
+            _object(data["preview"], "job.preview")
         preview_hash = data.get("previewHash")
         decision = data.get("approvalDecision")
         request_text = data.get("requestText")
