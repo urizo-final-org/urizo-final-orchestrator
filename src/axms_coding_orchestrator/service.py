@@ -619,9 +619,15 @@ def main() -> None:
                 executor=SpringGatewayCodingStageExecutor(coding_domain_client),
             ),
         )
+        # The Natural CMS stage carries a model round trip on the Spring side too, so the
+        # ten-second default cut it off before Spring's own budget ran out: the gateway
+        # allows thirty seconds per model call and retries once, which the caller has to
+        # outlast. A short body finished in time and a longer one did not, which is why
+        # only the bigger requests failed. Same value and same reason as the coding lane.
         natural_cms_domain_client = SpringNaturalCmsDomainClient(
             settings.spring_origin,
             credential_resolver,
+            timeout_seconds=180.0,
         )
         natural_cms_registry = register_natural_cms_node_handlers(
             build_common_node_registry(),
